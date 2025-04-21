@@ -1,0 +1,422 @@
+from fastapi import FastAPI, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+from pymongo import MongoClient
+import logging
+import asyncio
+from datetime import datetime
+import uuid
+import json
+import os
+from dotenv import load_dotenv
+from semantic_kernel import Kernel
+from email_reader import EmailReaderPlugin
+from email_sender import EmailSenderPlugin
+from ado import ADOPlugin
+from git import GitPlugin
+from sk_agent import SKAgent
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("agent.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI app
+app = FastAPI()
+
+# Enable CORS for React frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Load environment variables
+load_dotenv()
+
+# Initialize MongoDB
+mongo_client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+db = mongo_client["email_agent"]
+tickets_collection = db["tickets"]
+tickets_collection.create_index("ado_ticket_id", unique=True)
+logger.info("Initialized MongoDB: email_agent.tickets")
+
+# Global state
+is_running = False
+email_task = None
+ticket_task = None
+session_id = None
+ticket_info = {}
+websocket_clients = []
+
+async def process_emails():
+    """Poll for new emails and process them."""
+    kernel = Kernel()
+    kernel.add_plugin(EmailReaderPlugin(), plugin_name="email_reader")
+    kernel.add_plugin(EmailSenderPlugin(), plugin_name="email_sender")
+    kernel.add_plugin(ADOPlugin(), plugin_name="ado")
+    kernel.add_plugin(GitPlugin(), plugin_name="git")
+    agent = SKAgent(kernel)
+    logger.info(f"Registered plugins: {list(kernel.plugins.keys())}")
+
+    while is_running:
+        try:
+            logger.info("Checking for new unread emails...")
+            email_result = await kernel.invoke(
+                kernel.plugins["email_reader"]["fetch_new_emails"],
+                limit=1
+            )
+            emails = email_result.value if email_result else []
+            
+            if not emails:
+                logger.info("No new unread emails found.")
+            else:
+                for email in emails:
+                    email_id = email["id"]
+                    thread_id = email.get("threadId", email_id)
+                    # Check if email is already processed
+                    existing_ticket = tickets_collection.find_one({
+                        "$or": [
+                            {"email_id": email_id},
+                            {"thread_id": thread_id}
+                        ]
+                    })
+                    if existing_ticket:
+                        logger.info(f"Email ID={email_id} or Thread ID={thread_id} already processed, skipping.")
+                        continue
+
+                    # Broadcast: New email arrived
+                    await broadcast({
+                        "type": "email_detected",
+                        "subject": email['subject'],
+                        "sender": email.get("from", "Unknown"),
+                        "email_id": email_id
+                    })
+                    logger.info(f"Processing email - Subject: {email['subject']}, From: {email.get('from', 'Unknown')}")
+
+                    # Process email with SK agent
+                    result = await agent.process_email(email, broadcast)
+                    logger.info(f"Agent result for email ID={email_id}: {result}")
+                    
+                    if result["status"] == "success":
+                        ticket_id = result["ticket_id"]
+                        intent = result.get("intent", "general_it_request")
+                        # Store ticket in MongoDB without initial update
+                        ticket_record = {
+                            "ado_ticket_id": ticket_id,
+                            "sender": email.get("from", "Unknown"),
+                            "subject": email["subject"],
+                            "thread_id": thread_id,
+                            "email_id": email_id,
+                            "ticket_description": result.get("ticket_description", f"IT request for {email['subject']}"),
+                            "email_timestamp": datetime.now().isoformat(),
+                            "updates": [],
+                            "details": {
+                                "github": result.get("github", {}) if intent == "github_access_request" else {}
+                            }
+                        }
+                        tickets_collection.insert_one(ticket_record)
+                        ticket_info[ticket_id] = {
+                            "sender": email.get("from", "Unknown"),
+                            "subject": email["subject"],
+                            "thread_id": thread_id,
+                            "email_id": email_id,
+                            "last_revision_id": 0
+                        }
+                        logger.info(f"Stored ticket for email ID={email_id}, ADO ticket ID={ticket_id}")
+                        # Broadcast: Ticket created
+                        ado_url = f"https://dev.azure.com/{os.getenv('ADO_ORGANIZATION')}/{os.getenv('ADO_PROJECT')}/_workitems/edit/{ticket_id}"
+                        await broadcast({
+                            "type": "ticket_created",
+                            "email_id": email_id,
+                            "ticket_id": ticket_id,
+                            "subject": email["subject"],
+                            "intent": intent,
+                            "ado_url": ado_url
+                        })
+
+                        if intent == "github_access_request":
+                            # GitHub action handled in SKAgent, broadcast result
+                            github_result = result.get("github", {})
+                            success = github_result.get("success", False)
+                            message = github_result.get("message", "GitHub action processed")
+                            await broadcast({
+                                "type": "github_action",
+                                "email_id": email_id,
+                                "ticket_id": ticket_id,
+                                "success": success,
+                                "message": message
+                            })
+                            # Update ADO ticket with single comment and appropriate status
+                            status = "Done" if success else "To Do"
+                            update_result = await kernel.invoke(
+                                kernel.plugins["ado"]["update_ticket"],
+                                ticket_id=ticket_id,
+                                status=status,
+                                comment=message
+                            )
+                            if update_result:
+                                # Store the update in MongoDB
+                                tickets_collection.update_one(
+                                    {"ado_ticket_id": ticket_id},
+                                    {
+                                        "$push": {
+                                            "updates": {
+                                                "status": status,
+                                                "comment": message,
+                                                "revision_id": f"git-{ticket_id}",
+                                                "email_sent": False,
+                                                "email_message_id": None,
+                                                "email_timestamp": datetime.now().isoformat()
+                                            }
+                                        }
+                                    }
+                                )
+                                await broadcast({
+                                    "type": "ticket_updated",
+                                    "email_id": email_id,
+                                    "ticket_id": ticket_id,
+                                    "status": status,
+                                    "comment": message
+                                })
+                        else:
+                            # General IT request: Ticket already created, no additional update
+                            pass
+                    else:
+                        logger.error(f"Failed to process email ID={email_id}: {result['message']}")
+                        await broadcast({
+                            "type": "error",
+                            "email_id": email_id,
+                            "message": f"Failed to process email: {result['message']}"
+                        })
+
+            await asyncio.sleep(60)
+        except Exception as e:
+            logger.error(f"Error in email processing loop: {str(e)}")
+            await asyncio.sleep(60)
+
+async def process_tickets():
+    """Check for ADO ticket updates."""
+    kernel = Kernel()
+    kernel.add_plugin(ADOPlugin(), plugin_name="ado")
+    kernel.add_plugin(EmailSenderPlugin(), plugin_name="email_sender")
+    agent = SKAgent(kernel)
+
+    while is_running:
+        try:
+            logger.info(f"Checking for ADO ticket updates in session {session_id}...")
+            tickets = tickets_collection.find()
+            
+            for ticket in tickets:
+                ticket_id = ticket["ado_ticket_id"]
+                update_result = await kernel.invoke(
+                    kernel.plugins["ado"]["get_ticket_updates"],
+                    ticket_id=ticket_id
+                )
+                updates = update_result.value if update_result else []
+                ticket_data = ticket_info.get(ticket_id, {"last_revision_id": 0})
+                last_revision_id = ticket_data["last_revision_id"]
+                
+                new_updates = [u for u in updates if u['revision_id'] > last_revision_id]
+                
+                if new_updates:
+                    logger.info(f"Found {len(new_updates)} new updates for ticket ID={ticket_id}")
+                    update_result = await agent.analyze_ticket_update(ticket_id, new_updates)
+                    
+                    if update_result["update_intent"] != "error":
+                        sender = ticket.get('sender', 'Unknown')
+                        subject = ticket.get('subject', f"Update for Ticket {ticket_id}")
+                        thread_id = ticket.get('thread_id', str(uuid.uuid4()))
+                        email_id = ticket.get('email_id', str(uuid.uuid4()))
+                        
+                        reply_result = await kernel.invoke(
+                            kernel.plugins["email_sender"]["send_reply"],
+                            to=sender,
+                            subject=subject,
+                            body=update_result["email_response"],
+                            thread_id=thread_id,
+                            message_id=email_id
+                        )
+                        email_status = bool(reply_result and reply_result.value)
+                        email_message_id = reply_result.value.get("message_id") if reply_result and reply_result.value else None
+                        
+                        for update in new_updates:
+                            tickets_collection.update_one(
+                                {"ado_ticket_id": ticket_id},
+                                {
+                                    "$push": {
+                                        "updates": {
+                                            "comment": update["comment"] or "No comment provided",
+                                            "status": update["status"],
+                                            "revision_id": update["revision_id"],
+                                            "email_sent": email_status,
+                                            "email_message_id": email_message_id,
+                                            "email_timestamp": datetime.now().isoformat()
+                                        }
+                                    }
+                                },
+                                upsert=True
+                            )
+                        
+                        if email_status:
+                            ticket_info[ticket_id] = {
+                                "sender": sender,
+                                "subject": subject,
+                                "thread_id": thread_id,
+                                "email_id": email_id,
+                                "last_revision_id": max(u['revision_id'] for u in updates)
+                            }
+                            await broadcast({
+                                "type": "email_reply",
+                                "email_id": email_id,
+                                "ticket_id": ticket_id,
+                                "thread_id": thread_id,
+                                "timestamp": datetime.now().isoformat()
+                            })
+                    else:
+                        for update in new_updates:
+                            tickets_collection.update_one(
+                                {"ado_ticket_id": ticket_id},
+                                {
+                                    "$push": {
+                                        "updates": {
+                                            "comment": update["comment"] or "No comment provided",
+                                            "status": update["status"],
+                                            "revision_id": update["revision_id"],
+                                            "email_sent": False,
+                                            "email_message_id": None,
+                                            "email_timestamp": datetime.now().isoformat()
+                                        }
+                                    }
+                                },
+                                upsert=True
+                            )
+                        ticket_info[ticket_id]["last_revision_id"] = max(u['revision_id'] for u in updates)
+            
+            await asyncio.sleep(60)
+        except Exception as e:
+            logger.error(f"Error in ticket processing loop: {str(e)}")
+            await asyncio.sleep(60)
+
+@app.get("/run-agent")
+async def run_agent():
+    """Start the email and ticket tracking agent."""
+    global is_running, email_task, ticket_task, session_id, ticket_info
+    if is_running:
+        logger.info("Agent is already running.")
+        return {"status": "info", "message": "Agent is already running"}
+    
+    logger.info("Starting email and ticket tracking agent...")
+    session_id = str(uuid.uuid4())
+    ticket_info = {}
+    kernel = Kernel()
+    kernel.add_plugin(ADOPlugin(), plugin_name="ado")
+    work_items_result = await kernel.invoke(
+        kernel.plugins["ado"]["get_all_work_items"]
+    )
+    work_items = work_items_result.value if work_items_result else []
+    for work_item in work_items:
+        ticket_id = work_item['id']
+        updates_result = await kernel.invoke(
+            kernel.plugins["ado"]["get_ticket_updates"],
+            ticket_id=ticket_id
+        )
+        updates = updates_result.value if updates_result else []
+        last_revision_id = max((u['revision_id'] for u in updates), default=0)
+        ticket_record = tickets_collection.find_one({"ado_ticket_id": ticket_id})
+        ticket_info[ticket_id] = {
+            "sender": ticket_record.get('sender', 'Unknown') if ticket_record else 'Unknown',
+            "subject": ticket_record.get('subject', f"Update for Ticket {ticket_id}") if ticket_record else f"Update for Ticket {ticket_id}",
+            "thread_id": ticket_record.get('thread_id', str(uuid.uuid4())) if ticket_record else str(uuid.uuid4()),
+            "email_id": ticket_record.get('email_id', str(uuid.uuid4())) if ticket_record else str(uuid.uuid4()),
+            "last_revision_id": last_revision_id
+        }
+    is_running = True
+    email_task = asyncio.create_task(process_emails())
+    ticket_task = asyncio.create_task(process_tickets())
+    
+    await broadcast({"type": "session", "session_id": session_id, "status": "started"})
+    return {"status": "success", "message": f"Agent started with session ID={session_id}"}
+
+@app.get("/stop-agent")
+async def stop_agent():
+    """Stop the email and ticket tracking agent."""
+    global is_running, email_task, ticket_task, session_id, ticket_info
+    if not is_running:
+        logger.info("Agent is not running.")
+        return {"status": "info", "message": "Agent is not running"}
+    
+    logger.info(f"Stopping agent for session {session_id}...")
+    is_running = False
+    if email_task:
+        email_task.cancel()
+    if ticket_task:
+        ticket_task.cancel()
+    email_task = None
+    ticket_task = None
+    session_id = None
+    ticket_info = {}
+    await broadcast({"type": "session", "session_id": None, "status": "stopped"})
+    return {"status": "success", "message": "Agent stopped"}
+
+@app.get("/tickets")
+async def get_tickets():
+    """Get all tickets from MongoDB."""
+    try:
+        tickets = list(tickets_collection.find({}, {"_id": 0}))
+        logger.info(f"Returning {len(tickets)} tickets from /tickets endpoint")
+        return {"status": "success", "tickets": tickets}
+    except Exception as e:
+        logger.error(f"Error fetching tickets: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+@app.get("/logs")
+async def get_logs():
+    """Get recent logs from agent.log."""
+    try:
+        with open("agent.log", "r") as f:
+            logs = f.readlines()[-50:]  # Last 50 lines
+        return {"status": "success", "logs": logs}
+    except Exception as e:
+        logger.error(f"Error fetching logs: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+@app.get("/status")
+async def get_status():
+    """Get the current status of the agent."""
+    return {"status": "success", "is_running": is_running, "session_id": session_id}
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """Handle WebSocket connections."""
+    await websocket.accept()
+    logger.info("WebSocket connection accepted")
+    websocket_clients.append(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except Exception as e:
+        logger.error(f"WebSocket error: {str(e)}")
+        websocket_clients.remove(websocket)
+    finally:
+        logger.info("WebSocket connection closed")
+
+async def broadcast(message):
+    """Broadcast a message to all WebSocket connections."""
+    logger.info(f"Broadcasting message: {message}")
+    for client in websocket_clients:
+        try:
+            await client.send_json(message)
+        except Exception as e:
+            logger.error(f"Error broadcasting to WebSocket: {str(e)}")
+
+@app.get("/")
+async def root():
+    return {"message": "Email Agent API is running"}

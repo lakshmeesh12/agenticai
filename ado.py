@@ -1,0 +1,222 @@
+from azure.devops.connection import Connection
+from msrest.authentication import BasicAuthentication
+import os
+from dotenv import load_dotenv
+import logging
+from semantic_kernel.functions import kernel_function
+import datetime
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+
+class ADOPlugin:
+    def __init__(self):
+        self.client = ADOClient()
+
+    @kernel_function(
+        description="Fetch all work items in the Azure DevOps project.",
+        name="get_all_work_items"
+    )
+    async def get_all_work_items(self) -> list:
+        """
+        Fetch all ADO work items.
+        Returns:
+            list: List of work items with id, title, status, created, updated.
+        """
+        return self.client.get_all_work_items()
+
+    @kernel_function(
+        description="Create a new work item in Azure DevOps.",
+        name="create_ticket"
+    )
+    async def create_ticket(self, title: str, description: str) -> dict:
+        """
+        Create an ADO ticket.
+        Args:
+            title (str): Ticket title.
+            description (str): Ticket description.
+        Returns:
+            dict: Ticket details {id, url} or None if failed.
+        """
+        return self.client.create_ticket(title, description)
+
+    @kernel_function(
+        description="Update an Azure DevOps ticket with status and comment.",
+        name="update_ticket"
+    )
+    async def update_ticket(self, ticket_id: int, status: str, comment: str) -> dict:
+        """
+        Update an ADO ticket.
+        Args:
+            ticket_id (int): Ticket ID.
+            status (str): New status (To Do, Doing, Done).
+            comment (str): Update comment.
+        Returns:
+            dict: Updated ticket details {id, status, comment} or None if failed.
+        """
+        return self.client.update_ticket(ticket_id, status, comment)
+
+    @kernel_function(
+        description="Fetch updates for an Azure DevOps ticket.",
+        name="get_ticket_updates"
+    )
+    async def get_ticket_updates(self, ticket_id: int) -> list:
+        """
+        Fetch ticket updates.
+        Args:
+            ticket_id (int): Ticket ID.
+        Returns:
+            list: List of updates {comment, status, revision_id}.
+        """
+        return self.client.get_ticket_updates(ticket_id)
+
+class ADOClient:
+    def __init__(self):
+        self.organization_url = os.getenv("ADO_ORGANIZATION_URL")
+        self.personal_access_token = os.getenv("ADO_PERSONAL_ACCESS_TOKEN")
+        self.project = os.getenv("ADO_PROJECT")
+        self.connection = self._initialize_connection()
+        self.client = self.connection.clients.get_work_item_tracking_client()
+        logger.info("Initialized Azure DevOps client")
+
+    def _initialize_connection(self):
+        """Initialize connection to Azure DevOps."""
+        try:
+            credentials = BasicAuthentication("", self.personal_access_token)
+            connection = Connection(base_url=self.organization_url, creds=credentials)
+            return connection
+        except Exception as e:
+            logger.error(f"Failed to initialize ADO connection: {str(e)}")
+            raise
+
+    def create_ticket(self, title, description):
+        """Create a new work item in Azure DevOps."""
+        try:
+            document = [
+                {
+                    "op": "add",
+                    "path": "/fields/System.Title",
+                    "value": title
+                },
+                {
+                    "op": "add",
+                    "path": "/fields/System.Description",
+                    "value": description
+                },
+                {
+                    "op": "add",
+                    "path": "/fields/System.WorkItemType",
+                    "value": "Issue"
+                }
+            ]
+            work_item = self.client.create_work_item(
+                document=document,
+                project=self.project,
+                type="Issue"
+            )
+            ticket = {
+                "id": work_item.id,
+                "url": f"{self.organization_url}/{self.project}/_workitems/edit/{work_item.id}"
+            }
+            logger.info(f"Created ADO work item: ID={ticket['id']}, Title={title}")
+            return ticket
+        except Exception as e:
+            logger.error(f"Error creating ADO ticket: {str(e)}")
+            return None
+
+    def get_all_work_items(self):
+        """Fetch all work items in the project using WIQL."""
+        try:
+            wiql_query = f"""
+            SELECT [System.Id], [System.Title], [System.State], [System.CreatedDate], [System.ChangedDate]
+            FROM WorkItems
+            WHERE [System.TeamProject] = '{self.project}'
+            """
+            query_result = self.connection.clients.get_work_item_tracking_client().query_by_wiql(
+                wiql={"query": wiql_query}
+            )
+            work_items = []
+            for wi in query_result.work_items:
+                work_item = self.client.get_work_item(wi.id, project=self.project, expand="All")
+                work_items.append({
+                    "id": work_item.id,
+                    "title": work_item.fields.get("System.Title", f"Ticket {work_item.id}"),
+                    "status": work_item.fields.get("System.State", "New"),
+                    "created": work_item.fields.get("System.CreatedDate", datetime.datetime.now().isoformat()),
+                    "updated": work_item.fields.get("System.ChangedDate", datetime.datetime.now().isoformat())
+                })
+            logger.info(f"Fetched {len(work_items)} work items")
+            return work_items
+        except Exception as e:
+            logger.error(f"Error fetching work items: {str(e)}")
+            return []
+
+    def get_ticket_updates(self, ticket_id):
+        """Fetch all updates for a specific ticket."""
+        try:
+            updates = []
+            work_item = self.client.get_work_item(ticket_id, project=self.project, expand="All")
+            revisions = self.client.get_revisions(ticket_id, project=self.project)
+
+            for revision in revisions:
+                fields = revision.fields if hasattr(revision, 'fields') else {}
+                comment = ""
+                if 'System.History' in fields:
+                    history = fields['System.History']
+                    comment = history.get('newValue', '') if isinstance(history, dict) else (history or '')
+                
+                status = work_item.fields.get("System.State", "To Do")
+
+                updates.append({
+                    "comment": comment,
+                    "status": status,
+                    "revision_id": revision.rev
+                })
+
+            logger.info(f"Fetched {len(updates)} updates for ticket ID={ticket_id}")
+            return updates
+        except Exception as e:
+            logger.error(f"Error fetching updates for ticket ID={ticket_id}: {str(e)}")
+            return []
+
+    def update_ticket(self, ticket_id, status, comment):
+        """Update ticket status and add a comment."""
+        try:
+            valid_states = ["To Do", "Doing", "Done"]
+            if status not in valid_states:
+                logger.warning(f"Invalid status: {status}. Using 'To Do'.")
+                status = "To Do"
+
+            document = [
+                {
+                    "op": "add",
+                    "path": "/fields/System.State",
+                    "value": status
+                },
+                {
+                    "op": "add",
+                    "path": "/fields/System.History",
+                    "value": comment
+                }
+            ]
+            updated_work_item = self.client.update_work_item(
+                document=document,
+                id=ticket_id,
+                project=self.project
+            )
+            logger.info(f"Updated ADO ticket ID={ticket_id} with status={status}, comment={comment}")
+            return {
+                "id": updated_work_item.id,
+                "status": status,
+                "comment": comment
+            }
+        except Exception as e:
+            logger.error(f"Error updating ADO ticket ID={ticket_id}: {str(e)}")
+            return None
