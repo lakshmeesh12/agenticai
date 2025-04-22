@@ -46,6 +46,7 @@ mongo_client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
 db = mongo_client["email_agent"]
 tickets_collection = db["tickets"]
 tickets_collection.create_index("ado_ticket_id", unique=True)
+tickets_collection.create_index("thread_id")
 logger.info("Initialized MongoDB: email_agent.tickets")
 
 # Global state
@@ -81,15 +82,12 @@ async def process_emails():
                 for email in emails:
                     email_id = email["id"]
                     thread_id = email.get("threadId", email_id)
-                    # Check if email is already processed
-                    existing_ticket = tickets_collection.find_one({
-                        "$or": [
-                            {"email_id": email_id},
-                            {"thread_id": thread_id}
-                        ]
-                    })
-                    if existing_ticket:
-                        logger.info(f"Email ID={email_id} or Thread ID={thread_id} already processed, skipping.")
+                    # Check if email is part of an existing thread
+                    existing_ticket = tickets_collection.find_one({"thread_id": thread_id})
+
+                    # Skip if the email ID has already been processed
+                    if existing_ticket and existing_ticket["email_id"] == email_id:
+                        logger.info(f"Email ID={email_id} already processed, skipping.")
                         continue
 
                     # Broadcast: New email arrived
@@ -101,94 +99,136 @@ async def process_emails():
                     })
                     logger.info(f"Processing email - Subject: {email['subject']}, From: {email.get('from', 'Unknown')}")
 
-                    # Process email with SK agent
-                    result = await agent.process_email(email, broadcast)
+                    # Process email with SK agent - THIS WILL CALL analyze_intent INTERNALLY
+                    result = await agent.process_email(email, broadcast, existing_ticket)
                     logger.info(f"Agent result for email ID={email_id}: {result}")
                     
                     if result["status"] == "success":
                         ticket_id = result["ticket_id"]
                         intent = result.get("intent", "general_it_request")
-                        # Store ticket in MongoDB without initial update
-                        ticket_record = {
-                            "ado_ticket_id": ticket_id,
-                            "sender": email.get("from", "Unknown"),
-                            "subject": email["subject"],
-                            "thread_id": thread_id,
-                            "email_id": email_id,
-                            "ticket_description": result.get("ticket_description", f"IT request for {email['subject']}"),
-                            "email_timestamp": datetime.now().isoformat(),
-                            "updates": [],
-                            "details": {
-                                "github": result.get("github", {}) if intent == "github_access_request" else {}
-                            }
-                        }
-                        tickets_collection.insert_one(ticket_record)
-                        ticket_info[ticket_id] = {
-                            "sender": email.get("from", "Unknown"),
-                            "subject": email["subject"],
-                            "thread_id": thread_id,
-                            "email_id": email_id,
-                            "last_revision_id": 0
-                        }
-                        logger.info(f"Stored ticket for email ID={email_id}, ADO ticket ID={ticket_id}")
-                        # Broadcast: Ticket created
-                        ado_url = f"https://dev.azure.com/{os.getenv('ADO_ORGANIZATION')}/{os.getenv('ADO_PROJECT')}/_workitems/edit/{ticket_id}"
-                        await broadcast({
-                            "type": "ticket_created",
-                            "email_id": email_id,
-                            "ticket_id": ticket_id,
-                            "subject": email["subject"],
-                            "intent": intent,
-                            "ado_url": ado_url
-                        })
+                        actions = result.get("actions", [])
+                        pending_actions = result.get("pending_actions", False)
+                        is_follow_up = bool(existing_ticket)
 
-                        if intent == "github_access_request":
-                            # GitHub action handled in SKAgent, broadcast result
-                            github_result = result.get("github", {})
-                            success = github_result.get("success", False)
-                            message = github_result.get("message", "GitHub action processed")
-                            await broadcast({
-                                "type": "github_action",
+                        # For debugging - let's log available fields in result
+                        logger.info(f"Available fields in result: {list(result.keys())}")
+
+                        # Email intent analysis for GitHub details
+                        email_intent_result = await agent.analyze_intent(email["subject"], email["body"])
+                        logger.info(f"Email intent analysis for GitHub details: {email_intent_result}")
+                        
+                        # Extract GitHub details from the intent analysis
+                        repo_name = email_intent_result.get("repo_name")
+                        github_username = email_intent_result.get("github_username")
+                        access_type = email_intent_result.get("access_type", "read")
+                        
+                        # Create a valid GitHub details object with the extracted values
+                        github_details = {
+                            "repo_name": repo_name if repo_name and repo_name != "unspecified" else "",
+                            "username": github_username if github_username and github_username != "unspecified" else "",
+                            "access_type": access_type if access_type and access_type != "unspecified" else "read",
+                            "status": "pending"
+                        }
+                        
+                        # Log the GitHub details for debugging
+                        logger.info(f"GitHub details extracted: {github_details}")
+
+                        if not is_follow_up:
+                            # Store new ticket in MongoDB
+                            ticket_record = {
+                                "ado_ticket_id": ticket_id,
+                                "sender": email.get("from", "Unknown"),
+                                "subject": email["subject"],
+                                "thread_id": thread_id,
                                 "email_id": email_id,
-                                "ticket_id": ticket_id,
-                                "success": success,
-                                "message": message
-                            })
-                            # Update ADO ticket with single comment and appropriate status
-                            status = "Done" if success else "To Do"
-                            update_result = await kernel.invoke(
-                                kernel.plugins["ado"]["update_ticket"],
-                                ticket_id=ticket_id,
-                                status=status,
-                                comment=message
-                            )
-                            if update_result:
-                                # Store the update in MongoDB
+                                "ticket_description": result.get("ticket_description", f"IT request for {email['subject']}"),
+                                "email_timestamp": datetime.now().isoformat(),
+                                "updates": [],
+                                "actions": actions,
+                                "pending_actions": pending_actions,
+                                "type_of_request": "github",  # Simplified top-level category
+                                "details": {}  # Initialize empty details dictionary
+                            }
+                            
+                            # Handle GitHub specific fields
+                            if intent.startswith("github_"):  # Match any github related intent
+                                # Create GitHub details with the specific request type
+                                github_request = {
+                                    "request_type": intent,  # Store the specific intent here (github_access_request or github_revoke_request)
+                                    "repo_name": repo_name if repo_name and repo_name != "unspecified" else "",
+                                    "username": github_username if github_username and github_username != "unspecified" else "",
+                                    "access_type": access_type if access_type and access_type != "unspecified" else "read",
+                                    "status": "pending"
+                                }
+                                
+                                # Initialize github array and add first request
+                                ticket_record["details"]["github"] = [github_request]
+                            
+                            # Handle other request types as needed
+                            elif intent == "vpn_access_request":
+                                ticket_record["details"]["vpn"] = result.get("vpn", {})
+                            # ...other request types
+                            
+                            tickets_collection.insert_one(ticket_record)
+                            # ...rest of the code
+                        else:
+                            # Handle follow-up requests
+                            if intent.startswith("github_"):  # Match any github related intent
+                                # Create GitHub details for the new request
+                                new_github_request = {
+                                    "request_type": intent,  # Store specific intent (github_access_request or github_revoke_request)
+                                    "repo_name": repo_name if repo_name and repo_name != "unspecified" else "",
+                                    "username": github_username if github_username and github_username != "unspecified" else "",
+                                    "access_type": access_type if access_type and access_type != "unspecified" else "read",
+                                    "status": "pending" if intent == "github_access_request" else "revoked"
+                                }
+                                
+                                # Update comment based on request type
+                                comment = (f"Additional GitHub access request for {github_username} to repo {repo_name}" 
+                                        if intent == "github_access_request" else 
+                                        f"Revoke GitHub access for {github_username} from repo {repo_name}")
+                                
+                                # Prepare update operation
+                                update_operation = {
+                                    "$push": {
+                                        "updates": {
+                                            "status": "Pending" if intent == "github_access_request" else "Done",
+                                            "comment": comment,
+                                            "revision_id": f"git-{intent.split('_')[1]}-{ticket_id}-{len(existing_ticket.get('updates', []))+1}",
+                                            "email_sent": False,
+                                            "email_message_id": None,
+                                            "email_timestamp": datetime.now().isoformat()
+                                        }
+                                    },
+                                    "$set": {
+                                        "actions": actions,
+                                        "pending_actions": intent == "github_access_request",  # Set to true for access requests, false for revokes
+                                        "type_of_request": "github"  # Ensure consistent top-level type
+                                    }
+                                }
+                                
+                                # Check if github details array exists, if not create it
+                                if "github" not in existing_ticket.get("details", {}):
+                                    update_operation["$set"]["details.github"] = [new_github_request]
+                                else:
+                                    # Add to existing array of github requests
+                                    update_operation["$push"]["details.github"] = new_github_request
+                                
+                                # Update the ticket in MongoDB
                                 tickets_collection.update_one(
                                     {"ado_ticket_id": ticket_id},
-                                    {
-                                        "$push": {
-                                            "updates": {
-                                                "status": status,
-                                                "comment": message,
-                                                "revision_id": f"git-{ticket_id}",
-                                                "email_sent": False,
-                                                "email_message_id": None,
-                                                "email_timestamp": datetime.now().isoformat()
-                                            }
-                                        }
-                                    }
+                                    update_operation
                                 )
+                                
+                                # Broadcast update
                                 await broadcast({
                                     "type": "ticket_updated",
                                     "email_id": email_id,
                                     "ticket_id": ticket_id,
-                                    "status": status,
-                                    "comment": message
+                                    "status": "Pending" if intent == "github_access_request" else "Done",
+                                    "request_type": intent,
+                                    "comment": comment
                                 })
-                        else:
-                            # General IT request: Ticket already created, no additional update
-                            pass
                     else:
                         logger.error(f"Failed to process email ID={email_id}: {result['message']}")
                         await broadcast({
@@ -201,7 +241,6 @@ async def process_emails():
         except Exception as e:
             logger.error(f"Error in email processing loop: {str(e)}")
             await asyncio.sleep(60)
-
 async def process_tickets():
     """Check for ADO ticket updates."""
     kernel = Kernel()
@@ -377,6 +416,17 @@ async def get_tickets():
         logger.error(f"Error fetching tickets: {str(e)}")
         return {"status": "error", "message": str(e)}
 
+@app.get("/tickets/by-type/{request_type}")
+async def get_tickets_by_type(request_type: str):
+    """Get tickets filtered by request type."""
+    try:
+        tickets = list(tickets_collection.find({"type_of_request": request_type}, {"_id": 0}))
+        logger.info(f"Returning {len(tickets)} tickets of type {request_type}")
+        return {"status": "success", "tickets": tickets}
+    except Exception as e:
+        logger.error(f"Error fetching tickets by type: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
 @app.get("/logs")
 async def get_logs():
     """Get recent logs from agent.log."""
@@ -392,6 +442,16 @@ async def get_logs():
 async def get_status():
     """Get the current status of the agent."""
     return {"status": "success", "is_running": is_running, "session_id": session_id}
+
+@app.get("/request-types")
+async def get_request_types():
+    """Get all distinct request types in the system."""
+    try:
+        distinct_types = tickets_collection.distinct("type_of_request")
+        return {"status": "success", "request_types": distinct_types}
+    except Exception as e:
+        logger.error(f"Error fetching request types: {str(e)}")
+        return {"status": "error", "message": str(e)}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
