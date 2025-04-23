@@ -122,17 +122,7 @@ async def process_emails():
                         github_username = email_intent_result.get("github_username")
                         access_type = email_intent_result.get("access_type", "read")
                         
-                        # Create a valid GitHub details object with the extracted values
-                        github_details = {
-                            "repo_name": repo_name if repo_name and repo_name != "unspecified" else "",
-                            "username": github_username if github_username and github_username != "unspecified" else "",
-                            "access_type": access_type if access_type and access_type != "unspecified" else "read",
-                            "status": "pending"
-                        }
-                        
-                        # Log the GitHub details for debugging
-                        logger.info(f"GitHub details extracted: {github_details}")
-
+                        # If this is a new ticket (not a follow-up)
                         if not is_follow_up:
                             # Store new ticket in MongoDB
                             ticket_record = {
@@ -146,55 +136,257 @@ async def process_emails():
                                 "updates": [],
                                 "actions": actions,
                                 "pending_actions": pending_actions,
-                                "type_of_request": "github",  # Simplified top-level category
+                                "type_of_request": "github" if intent.startswith("github_") else intent,
                                 "details": {}  # Initialize empty details dictionary
                             }
                             
-                            # Handle GitHub specific fields
-                            if intent.startswith("github_"):  # Match any github related intent
-                                # Create GitHub details with the specific request type
-                                github_request = {
-                                    "request_type": intent,  # Store the specific intent here (github_access_request or github_revoke_request)
+                            # Handle GitHub specific fields if it's a GitHub access request
+                            if intent == "github_access_request":
+                                # Create GitHub details object with initial pending status
+                                github_details = {
+                                    "request_type": intent,
                                     "repo_name": repo_name if repo_name and repo_name != "unspecified" else "",
                                     "username": github_username if github_username and github_username != "unspecified" else "",
                                     "access_type": access_type if access_type and access_type != "unspecified" else "read",
                                     "status": "pending"
                                 }
                                 
-                                # Initialize github array and add first request
-                                ticket_record["details"]["github"] = [github_request]
+                                # Store initial pending status in ticket record
+                                ticket_record["details"]["github"] = [github_details]
+                                
+                                # Insert the ticket with pending status
+                                tickets_collection.insert_one(ticket_record)
+                                
+                                # Now execute the GitHub action
+                                git_result = await kernel.invoke(
+                                    kernel.plugins["git"]["grant_repo_access"],
+                                    repo_name=github_details["repo_name"],
+                                    github_username=github_details["username"],
+                                    access_type="pull" if github_details["access_type"] == "read" else github_details["access_type"]
+                                )
+                                
+                                # Update MongoDB with the result of the GitHub action
+                                new_status = "completed" if git_result.value["success"] else "failed"
+                                tickets_collection.update_one(
+                                    {"ado_ticket_id": ticket_id, "details.github.username": github_details["username"]},
+                                    {
+                                        "$set": {
+                                            "details.github.$.status": new_status,
+                                            "details.github.$.message": git_result.value["message"]
+                                        }
+                                    }
+                                )
+                                
+                                # Log the result
+                                logger.info(f"GitHub access request completed with status: {new_status}, message: {git_result.value['message']}")
                             
-                            # Handle other request types as needed
-                            elif intent == "vpn_access_request":
-                                ticket_record["details"]["vpn"] = result.get("vpn", {})
-                            # ...other request types
-                            
-                            tickets_collection.insert_one(ticket_record)
-                            # ...rest of the code
-                        else:
-                            # Handle follow-up requests
-                            if intent.startswith("github_"):  # Match any github related intent
-                                # Create GitHub details for the new request
-                                new_github_request = {
-                                    "request_type": intent,  # Store specific intent (github_access_request or github_revoke_request)
-                                    "repo_name": repo_name if repo_name and repo_name != "unspecified" else "",
-                                    "username": github_username if github_username and github_username != "unspecified" else "",
-                                    "access_type": access_type if access_type and access_type != "unspecified" else "read",
-                                    "status": "pending" if intent == "github_access_request" else "revoked"
+                            # Handle general IT request
+                            elif intent == "general_it_request":
+                                # Create general IT request details
+                                general_details = {
+                                    "request_type": "general_it_request",
+                                    "status": "pending",
+                                    "message": f"General IT request created: {email['subject']}"
                                 }
                                 
-                                # Update comment based on request type
-                                comment = (f"Additional GitHub access request for {github_username} to repo {repo_name}" 
-                                        if intent == "github_access_request" else 
-                                        f"Revoke GitHub access for {github_username} from repo {repo_name}")
+                                # Store initial pending status in ticket record
+                                ticket_record["details"]["general"] = [general_details]
                                 
-                                # Prepare update operation
+                                # Insert the ticket with pending status
+                                tickets_collection.insert_one(ticket_record)
+                                
+                                # Log the result
+                                logger.info(f"General IT request created with status: pending")
+                                
+                            # Broadcast: Ticket created
+                            ado_url = f"https://dev.azure.com/{os.getenv('ADO_ORGANIZATION')}/{os.getenv('ADO_PROJECT')}/_workitems/edit/{ticket_id}"
+                            await broadcast({
+                                "type": "ticket_created",
+                                "email_id": email_id,
+                                "ticket_id": ticket_id,
+                                "subject": email["subject"],
+                                "intent": intent,
+                                "request_type": intent,
+                                "ado_url": ado_url
+                            })
+                        else:
+                            # Handle follow-up emails based on intent
+                            if intent.startswith("github_"):
+                                # GitHub follow-up handling remains unchanged
+                                # Common fields for both access and revoke operations
+                                comment = ""
+                                status = "pending"  # Start with pending status
+                                github_details = {}
+                                
+                                # Specific handling based on intent type
+                                if intent == "github_access_request":
+                                    # Create GitHub details for additional access request
+                                    github_details = {
+                                        "request_type": intent,
+                                        "repo_name": repo_name if repo_name and repo_name != "unspecified" else "",
+                                        "username": github_username if github_username and github_username != "unspecified" else "",
+                                        "access_type": access_type if access_type and access_type != "unspecified" else "read",
+                                        "status": "pending"
+                                    }
+                                    comment = f"Processing GitHub access request for {github_username} to repo {repo_name}"
+                                    
+                                    # First update MongoDB with pending status
+                                    update_operation = {
+                                        "$push": {
+                                            "updates": {
+                                                "status": status,
+                                                "comment": comment,
+                                                "revision_id": f"git-{intent.split('_')[1]}-{ticket_id}-{len(existing_ticket.get('updates', []))+1}",
+                                                "email_sent": False,
+                                                "email_message_id": None,
+                                                "email_timestamp": datetime.now().isoformat()
+                                            }
+                                        },
+                                        "$set": {
+                                            "actions": actions,
+                                            "pending_actions": True
+                                        }
+                                    }
+                                    
+                                    # Add github details to MongoDB
+                                    if "github" not in existing_ticket.get("details", {}):
+                                        update_operation["$set"]["details.github"] = [github_details]
+                                    else:
+                                        update_operation["$push"]["details.github"] = github_details
+                                    
+                                    tickets_collection.update_one(
+                                        {"ado_ticket_id": ticket_id},
+                                        update_operation
+                                    )
+                                    
+                                    # Execute GitHub action
+                                    git_result = await kernel.invoke(
+                                        kernel.plugins["git"]["grant_repo_access"],
+                                        repo_name=github_details["repo_name"],
+                                        github_username=github_details["username"],
+                                        access_type="pull" if github_details["access_type"] == "read" else github_details["access_type"]
+                                    )
+                                    
+                                    # Update MongoDB with the result
+                                    new_status = "completed" if git_result.value["success"] else "failed"
+                                    new_comment = git_result.value["message"]
+                                    
+                                    # Update the MongoDB record with action results
+                                    tickets_collection.update_one(
+                                        {"ado_ticket_id": ticket_id, "details.github.username": github_details["username"]},
+                                        {
+                                            "$set": {
+                                                "details.github.$[elem].status": new_status,
+                                                "details.github.$[elem].message": new_comment,
+                                                "pending_actions": False  # No longer pending after action completes
+                                            },
+                                            "$push": {
+                                                "updates": {
+                                                    "status": new_status,
+                                                    "comment": new_comment,
+                                                    "revision_id": f"git-result-{ticket_id}-{len(existing_ticket.get('updates', []))+2}",
+                                                    "email_sent": False,
+                                                    "email_message_id": None,
+                                                    "email_timestamp": datetime.now().isoformat()
+                                                }
+                                            }
+                                        },
+                                        array_filters=[{"elem.username": github_details["username"], "elem.request_type": intent}]
+                                    )
+                                    
+                                elif intent == "github_revoke_access":
+                                    # Similar approach for revoke operations
+                                    github_details = {
+                                        "request_type": intent,
+                                        "repo_name": repo_name if repo_name and repo_name != "unspecified" else "",
+                                        "username": github_username if github_username and github_username != "unspecified" else "",
+                                        "access_type": access_type if access_type and access_type != "unspecified" else "read",
+                                        "status": "pending"
+                                    }
+                                    comment = f"Processing access revocation for {github_username} from {repo_name}"
+                                    
+                                    # First update with pending status
+                                    update_operation = {
+                                        "$push": {
+                                            "updates": {
+                                                "status": status,
+                                                "comment": comment,
+                                                "revision_id": f"git-{intent.split('_')[1]}-{ticket_id}-{len(existing_ticket.get('updates', []))+1}",
+                                                "email_sent": False,
+                                                "email_message_id": None,
+                                                "email_timestamp": datetime.now().isoformat()
+                                            }
+                                        },
+                                        "$set": {
+                                            "actions": actions,
+                                            "pending_actions": True  # Set to true while in progress
+                                        }
+                                    }
+                                    
+                                    if "github" not in existing_ticket.get("details", {}):
+                                        update_operation["$set"]["details.github"] = [github_details]
+                                    else:
+                                        update_operation["$push"]["details.github"] = github_details
+                                    
+                                    tickets_collection.update_one(
+                                        {"ado_ticket_id": ticket_id},
+                                        update_operation
+                                    )
+                                    
+                                    # Execute the revoke action
+                                    git_result = await kernel.invoke(
+                                        kernel.plugins["git"]["revoke_repo_access"],
+                                        repo_name=github_details["repo_name"],
+                                        github_username=github_details["username"]
+                                    )
+                                    
+                                    # Update MongoDB with result
+                                    new_status = "revoked" if git_result.value["success"] else "failed"
+                                    new_comment = git_result.value["message"]
+                                    
+                                    tickets_collection.update_one(
+                                        {"ado_ticket_id": ticket_id, "details.github.username": github_details["username"]},
+                                        {
+                                            "$set": {
+                                                "details.github.$[elem].status": new_status,
+                                                "details.github.$[elem].message": new_comment,
+                                                "pending_actions": False  # No longer pending
+                                            },
+                                            "$push": {
+                                                "updates": {
+                                                    "status": new_status,
+                                                    "comment": new_comment,
+                                                    "revision_id": f"git-result-{ticket_id}-{len(existing_ticket.get('updates', []))+2}",
+                                                    "email_sent": False,
+                                                    "email_message_id": None,
+                                                    "email_timestamp": datetime.now().isoformat()
+                                                }
+                                            }
+                                        },
+                                        array_filters=[{"elem.username": github_details["username"], "elem.request_type": intent}]
+                                    )
+                                
+                                # Broadcast updated status
+                                await broadcast({
+                                    "type": "ticket_updated",
+                                    "email_id": email_id,
+                                    "ticket_id": ticket_id,
+                                    "status": new_status,
+                                    "request_type": intent,
+                                    "comment": new_comment
+                                })
+                            elif intent == "general_it_request":
+                                # Handle general IT request follow-up
+                                status = "updated"
+                                comment = f"Updated general IT request: {email['subject']}"
+                                
+                                # Create update operation
                                 update_operation = {
                                     "$push": {
                                         "updates": {
-                                            "status": "Pending" if intent == "github_access_request" else "Done",
+                                            "status": status,
                                             "comment": comment,
-                                            "revision_id": f"git-{intent.split('_')[1]}-{ticket_id}-{len(existing_ticket.get('updates', []))+1}",
+                                            "revision_id": f"general-update-{ticket_id}-{len(existing_ticket.get('updates', []))+1}",
                                             "email_sent": False,
                                             "email_message_id": None,
                                             "email_timestamp": datetime.now().isoformat()
@@ -202,33 +394,42 @@ async def process_emails():
                                     },
                                     "$set": {
                                         "actions": actions,
-                                        "pending_actions": intent == "github_access_request",  # Set to true for access requests, false for revokes
-                                        "type_of_request": "github"  # Ensure consistent top-level type
+                                        "pending_actions": False
                                     }
                                 }
                                 
-                                # Check if github details array exists, if not create it
-                                if "github" not in existing_ticket.get("details", {}):
-                                    update_operation["$set"]["details.github"] = [new_github_request]
-                                else:
-                                    # Add to existing array of github requests
-                                    update_operation["$push"]["details.github"] = new_github_request
+                                # Add general details to MongoDB if not exist
+                                general_details = {
+                                    "request_type": "general_it_request",
+                                    "status": status,
+                                    "message": comment
+                                }
                                 
-                                # Update the ticket in MongoDB
+                                if "general" not in existing_ticket.get("details", {}):
+                                    update_operation["$set"]["details.general"] = [general_details]
+                                else:
+                                    update_operation["$push"]["details.general"] = general_details
+                                
                                 tickets_collection.update_one(
                                     {"ado_ticket_id": ticket_id},
                                     update_operation
                                 )
                                 
-                                # Broadcast update
+                                # Broadcast updated status
                                 await broadcast({
                                     "type": "ticket_updated",
                                     "email_id": email_id,
                                     "ticket_id": ticket_id,
-                                    "status": "Pending" if intent == "github_access_request" else "Done",
+                                    "status": status,
                                     "request_type": intent,
                                     "comment": comment
                                 })
+                                
+                                logger.info(f"General IT request follow-up processed: {comment}")
+                            else:
+                                # Handle other non-GitHub follow-up intents
+                                logger.info(f"Processing non-GitHub follow-up for intent: {intent}")
+                                # Add your logic for handling other types of follow-ups here
                     else:
                         logger.error(f"Failed to process email ID={email_id}: {result['message']}")
                         await broadcast({

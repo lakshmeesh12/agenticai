@@ -213,6 +213,15 @@ class SKAgent:
                 status = "Done"  # Revocation typically completes all actions
                 comment = github_result["message"]
 
+                # Add this new GitHub revoke request to the result so main.py can use it
+                github_revoke_details = {
+                    "request_type": "github_revoke_access",
+                    "repo_name": repo_name,
+                    "username": github_username,
+                    "status": "revoked",
+                    "message": comment
+                }
+
                 await self.kernel.invoke(
                     self.kernel.plugins["ado"]["update_ticket"],
                     ticket_id=ticket_id,
@@ -259,7 +268,9 @@ class SKAgent:
                     "ticket_id": ticket_id,
                     "github": github_result,
                     "actions": [{"action": "revoke_access", "completed": github_result["success"]}],
-                    "pending_actions": False
+                    "pending_actions": False,
+                    "intent": intent,  # Make sure to include the intent
+                    "github_details": github_revoke_details  # Include the GitHub details
                 }
 
             # Handle new email
