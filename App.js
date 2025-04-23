@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
+import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 import './App.css';
 
 const App = () => {
@@ -11,6 +12,10 @@ const App = () => {
   const [search, setSearch] = useState('');
   const [wsError, setWsError] = useState(null);
   const [modals, setModals] = useState([]);
+  const [githubMetrics, setGithubMetrics] = useState({
+    byRequestType: [],
+    summary: { access: 0, revoke: 0, success: 0, pending: 0, failed: 0 }
+  });
 
   // WebSocket connection with reconnection
   useEffect(() => {
@@ -259,6 +264,70 @@ const App = () => {
     return () => clearInterval(interval);
   }, [agentStatus, sessionId]);
 
+  // Process GitHub data for visualization
+  useEffect(() => {
+    const processGitHubData = () => {
+      // Get all GitHub-related tickets
+      const githubTickets = tickets.filter(ticket => ticket.type_of_request === 'github' && ticket.details && ticket.details.github);
+      
+      const typeMap = new Map();
+      let accessCount = 0;
+      let revokeCount = 0;
+      let successCount = 0;
+      let pendingCount = 0;
+      let failedCount = 0;
+
+      githubTickets.forEach(ticket => {
+        if (!ticket.details || !ticket.details.github) return;
+        
+        ticket.details.github.forEach(request => {
+          // Count by request type
+          const requestType = request.request_type === 'github_access_request' ? 'Access' : 'Revoke';
+          if (!typeMap.has(requestType)) {
+            typeMap.set(requestType, { name: requestType, count: 0 });
+          }
+          typeMap.get(requestType).count += 1;
+          
+          // Update summary counts
+          if (request.request_type === 'github_access_request') {
+            accessCount++;
+          } else if (request.request_type === 'github_revoke_access') {
+            revokeCount++;
+          }
+          
+          // Fix the status counting logic
+          if (request.status === 'pending') {
+            pendingCount++;
+          } else if (request.status === 'completed' || request.status === 'revoked') {
+            // Count both "completed" and "revoked" as success
+            successCount++;
+          } else if (request.status.includes('error') || request.status.includes('failed')) {
+            failedCount++;
+          } else {
+            // Any other status also counted as failed for now
+            failedCount++;
+          }
+        });
+      });
+      
+      // Set the metrics state
+      setGithubMetrics({
+        byRequestType: Array.from(typeMap.values()),
+        summary: {
+          access: accessCount,
+          revoke: revokeCount,
+          success: successCount,
+          pending: pendingCount,
+          failed: failedCount
+        }
+      });
+    };
+    
+    if (tickets && tickets.length > 0) {
+      processGitHubData();
+    }
+  }, [tickets]);
+
   // Fetch tickets and logs
   useEffect(() => {
     const fetchData = async () => {
@@ -344,15 +413,13 @@ const App = () => {
       (ticket.subject || '').toLowerCase().includes(search.toLowerCase())
   );
 
-  // Calculate request summary
-  const requestSummary = {
-    github: {
-      success: tickets.filter(t => t.details && t.details.github && (t.updates || []).some(u => u.status === 'Done')).length,
-      failed: tickets.filter(t => t.details && t.details.github && (t.updates || []).some(u => u.status === 'To Do')).length
-    },
-    general: {
-      pending: tickets.filter(t => (!t.details || !t.details.github) && (t.updates || []).some(u => u.status === 'Doing')).length
-    }
+  // Colors for charts
+  const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884d8'];
+  
+  // Custom formatter for the Legend labels
+  const renderColorfulLegendText = (value, entry) => {
+    const { color } = entry;
+    return <span style={{ color }}>{value}</span>;
   };
 
   return (
@@ -367,30 +434,33 @@ const App = () => {
       </header>
 
       {/* Modals for Workflow Notifications */}
-      {modals.map((modal, index) => (
-        <div
-          key={modal.email_id}
-          className="modal"
-          style={{ top: `${100 + index * 20}px` }}
-        >
-          <div className="modal-content">
-            <h3>Email Processing Workflow (Email ID: {modal.email_id})</h3>
-            <ul>
-              {modal.steps.map((step, stepIndex) => (
-                <li key={stepIndex} className="modal-step">
-                  <strong>{step.status}:</strong> <span dangerouslySetInnerHTML={{ __html: step.details }} />
-                </li>
-              ))}
-            </ul>
-            <button
-              onClick={() => closeModal(modal.email_id)}
-              className="modal-close"
+      {modals.length > 0 && (
+        <div className="modal-container">
+          {modals.map((modal) => (
+            <div
+              key={modal.email_id}
+              className="modal"
             >
-              Close
-            </button>
-          </div>
+              <div className="modal-content">
+                <h3>Email Processing Workflow (Email ID: {modal.email_id})</h3>
+                <ul>
+                  {modal.steps.map((step, stepIndex) => (
+                    <li key={stepIndex} className="modal-step">
+                      <strong>{step.status}:</strong> <span dangerouslySetInnerHTML={{ __html: step.details }} />
+                    </li>
+                  ))}
+                </ul>
+                <button
+                  onClick={() => closeModal(modal.email_id)}
+                  className="modal-close"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          ))}
         </div>
-      ))}
+      )}
 
       {/* Main Content */}
       <div className="container">
@@ -433,16 +503,97 @@ const App = () => {
             className="search-input"
           />
 
-          {/* Request Summary */}
-          <div className="request-cards">
-            <div className="request-card">
-              <h3>GitHub Requests</h3>
-              <p>Success: {requestSummary.github.success}</p>
-              <p>Failed: {requestSummary.github.failed}</p>
-            </div>
-            <div className="request-card">
-              <h3>General IT Requests</h3>
-              <p>Pending: {requestSummary.general.pending}</p>
+          {/* GitHub Metrics Dashboard */}
+          <div className="github-dashboard">
+            <h3>GitHub Access Management Analytics</h3>
+            <div className="github-charts">
+              {/* Request Type Distribution */}
+              <div className="chart-container">
+                <h4>Request Distribution</h4>
+                <ResponsiveContainer width="100%" height={200}>
+                  <PieChart>
+                    <Pie
+                      data={githubMetrics.byRequestType}
+                      cx="50%"
+                      cy="50%"
+                      labelLine={false}
+                      outerRadius={70}
+                      fill="#8884d8"
+                      dataKey="count"
+                      nameKey="name"
+                    >
+                      {githubMetrics.byRequestType.map((entry, index) => (
+                        <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
+                      ))}
+                    </Pie>
+                    <Tooltip />
+                    <Legend 
+                      formatter={renderColorfulLegendText}
+                      layout="horizontal"
+                      verticalAlign="bottom"
+                      align="center"
+                    />
+                  </PieChart>
+                </ResponsiveContainer>
+                <div className="chart-legend">
+                  <div className="legend-item">
+                    <div className="legend-color" style={{ backgroundColor: '#0088FE' }}></div>
+                    <span>Access: {githubMetrics.summary.access}</span>
+                  </div>
+                  <div className="legend-item">
+                    <div className="legend-color" style={{ backgroundColor: '#00C49F' }}></div>
+                    <span>Revoke: {githubMetrics.summary.revoke}</span>
+                  </div>
+                </div>
+              </div>
+              
+              {/* Status Distribution */}
+              <div className="chart-container">
+                <h4>Request Status</h4>
+                <ResponsiveContainer width="100%" height={200}>
+                  <PieChart>
+                    <Pie
+                      data={[
+                        { name: 'Success', value: githubMetrics.summary.success },
+                        { name: 'Pending', value: githubMetrics.summary.pending },
+                        { name: 'Failed', value: githubMetrics.summary.failed }
+                      ]}
+                      cx="50%"
+                      cy="50%"
+                      labelLine={false}
+                      outerRadius={70}
+                      fill="#8884d8"
+                      dataKey="value"
+                      nameKey="name"
+                    >
+                      <Cell fill="#00C49F" />
+                      <Cell fill="#FFBB28" />
+                      <Cell fill="#FF8042" />
+                    </Pie>
+                    <Tooltip />
+                    <Legend 
+                      formatter={renderColorfulLegendText}
+                      layout="horizontal"
+                      verticalAlign="bottom"
+                      align="center"
+                    />
+                  </PieChart>
+                </ResponsiveContainer>
+                <div className="chart-legend">
+                  <div className="legend-item">
+                    <div className="legend-color" style={{ backgroundColor: '#00C49F' }}></div>
+                    <span>Success: {githubMetrics.summary.success}</span>
+                  </div>
+                  <div className="legend-item">
+                    <div className="legend-color" style={{ backgroundColor: '#FFBB28' }}></div>
+                    <span>Pending: {githubMetrics.summary.pending}</span>
+                  </div>
+                  <div className="legend-item">
+                    <div className="legend-color" style={{ backgroundColor: '#FF8042' }}></div>
+                    <span>Failed: {githubMetrics.summary.failed}</span>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
 
