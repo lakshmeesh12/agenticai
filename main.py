@@ -57,6 +57,16 @@ session_id = None
 ticket_info = {}
 websocket_clients = []
 
+def cleanup_temp_files(temp_files):
+    """Delete temporary files."""
+    for file_path in temp_files:
+        try:
+            if os.path.exists(file_path):
+                os.unlink(file_path)
+                logger.info(f"Deleted temporary file: {file_path}")
+        except Exception as e:
+            logger.error(f"Error deleting temporary file {file_path}: {str(e)}")
+
 async def process_emails():
     """Poll for new emails and process them."""
     kernel = Kernel()
@@ -90,6 +100,15 @@ async def process_emails():
                         logger.info(f"Email ID={email_id} already processed, skipping.")
                         continue
 
+                    # Construct email content for attachment (basic .eml format)
+                    email_content = f"""From: {email.get('from', 'Unknown')}
+Subject: {email['subject']}
+Date: {email.get('received', datetime.now().isoformat())}
+To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
+
+{email['body']}
+"""
+
                     # Broadcast: New email arrived
                     await broadcast({
                         "type": "email_detected",
@@ -99,8 +118,8 @@ async def process_emails():
                     })
                     logger.info(f"Processing email - Subject: {email['subject']}, From: {email.get('from', 'Unknown')}")
 
-                    # Process email with SK agent - THIS WILL CALL analyze_intent INTERNALLY
-                    result = await agent.process_email(email, broadcast, existing_ticket)
+                    # Process email with SK agent
+                    result = await agent.process_email(email, broadcast, existing_ticket, email_content)
                     logger.info(f"Agent result for email ID={email_id}: {result}")
                     
                     if result["status"] == "success":
@@ -131,7 +150,7 @@ async def process_emails():
                                 "subject": email["subject"],
                                 "thread_id": thread_id,
                                 "email_id": email_id,
-                                "ticket_description": result.get("ticket_description", f"IT request for {email['subject']}"),
+                                "ticket_description": email_intent_result.get("ticket_description", f"IT request for {email['subject']}"),
                                 "email_timestamp": datetime.now().isoformat(),
                                 "updates": [],
                                 "actions": actions,
@@ -182,15 +201,27 @@ async def process_emails():
                             
                             # Handle general IT request
                             elif intent == "general_it_request":
-                                # Create general IT request details
+                                # Extract sender username 
+                                sender_username = email.get("from", "Unknown").split('@')[0] if '@' in email.get("from", "Unknown") else "User"
+                                
+                                # Get the detailed description from intent analysis
+                                detailed_description = email_intent_result.get("ticket_description", "")
+                                
+                                # Make sure the sender is mentioned in the description
+                                if sender_username.lower() not in detailed_description.lower():
+                                    detailed_description = f"User {sender_username}: {detailed_description}"
+                                
+                                # Create general IT request details with specific description
                                 general_details = {
                                     "request_type": "general_it_request",
                                     "status": "pending",
-                                    "message": f"General IT request created: {email['subject']}"
+                                    "message": detailed_description,
+                                    "requester": sender_username
                                 }
                                 
-                                # Store initial pending status in ticket record
+                                # Store in ticket record
                                 ticket_record["details"]["general"] = [general_details]
+                                ticket_record["ticket_description"] = detailed_description  # Use the detailed description
                                 
                                 # Insert the ticket with pending status
                                 tickets_collection.insert_one(ticket_record)
@@ -438,10 +469,11 @@ async def process_emails():
                             "message": f"Failed to process email: {result['message']}"
                         })
 
-            await asyncio.sleep(60)
+            await asyncio.sleep(10)
         except Exception as e:
             logger.error(f"Error in email processing loop: {str(e)}")
-            await asyncio.sleep(60)
+            await asyncio.sleep(10)
+
 async def process_tickets():
     """Check for ADO ticket updates."""
     kernel = Kernel()
@@ -540,10 +572,10 @@ async def process_tickets():
                             )
                         ticket_info[ticket_id]["last_revision_id"] = max(u['revision_id'] for u in updates)
             
-            await asyncio.sleep(60)
+            await asyncio.sleep(10)
         except Exception as e:
             logger.error(f"Error in ticket processing loop: {str(e)}")
-            await asyncio.sleep(60)
+            await asyncio.sleep(10)
 
 @app.get("/run-agent")
 async def run_agent():

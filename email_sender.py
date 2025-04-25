@@ -6,54 +6,55 @@ from dotenv import load_dotenv
 import os
 import logging
 import base64
-import email.mime.text
-import email.utils
 from semantic_kernel.functions import kernel_function
+import email.mime.text
+import email.mime.multipart
+import time
+from collections import defaultdict
 
 # Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("email_sender")
 
 # Load environment variables
 load_dotenv()
 
 class EmailSenderPlugin:
     def __init__(self):
-        self.sender = EmailSender()
+        self.client = EmailSenderClient()
+        logger.info("Initialized Gmail send service")
 
     @kernel_function(
-        description="Send a threaded reply email via Gmail.",
+        description="Send an email reply to a recipient.",
         name="send_reply"
     )
     async def send_reply(self, to: str, subject: str, body: str, thread_id: str, message_id: str) -> dict:
         """
-        Send a reply email in an existing thread.
+        Send an email reply.
         Args:
             to (str): Recipient email address.
             subject (str): Email subject.
             body (str): Email body.
-            thread_id (str): Gmail thread ID.
-            message_id (str): Gmail message ID.
+            thread_id (str): Thread ID for reply.
+            message_id (str): Message ID for In-Reply-To header.
         Returns:
-            dict: Sent message details or None if failed.
+            dict: {'message_id': str} or None if failed or skipped due to deduplication.
         """
-        return self.sender.send_reply(to, subject, body, thread_id, message_id)
+        return self.client.send_reply(to, subject, body, thread_id, message_id)
 
-class EmailSender:
+class EmailSenderClient:
     def __init__(self):
         self.email_address = os.getenv("EMAIL_ADDRESS")
         self.service = None
+        self.sent_replies = defaultdict(float)  # In-memory cache: {thread_id: timestamp}
         self._initialize_service()
 
     def _initialize_service(self):
         """Initialize Gmail API service."""
         try:
-            SCOPES = ['https://www.googleapis.com/auth/gmail.send']
+            SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
             creds = None
-            token_path = 'token_send.json'
+            token_path = 'token.json'
 
             if os.path.exists(token_path):
                 creds = Credentials.from_authorized_user_file(token_path, SCOPES)
@@ -69,39 +70,67 @@ class EmailSender:
                     token.write(creds.to_json())
 
             self.service = build('gmail', 'v1', credentials=creds)
-            logger.info(f"Initialized Gmail send service for {self.email_address}")
+            logger.info(f"Authenticated to {self.email_address} for sending")
         except Exception as e:
             logger.error(f"Failed to initialize Gmail send service: {str(e)}")
             raise
 
     def send_reply(self, to, subject, body, thread_id, message_id):
-        """Send a reply email."""
+        """Send an email reply, skipping duplicates within a time window."""
         try:
-            logger.info(f"Preparing reply: To={to}, Subject={subject}, ThreadID={thread_id}, MessageID={message_id}")
-            logger.debug(f"Email body: {body}")
+            # Validate thread_id and message_id
+            if not thread_id or len(thread_id) < 10:
+                logger.warning(f"Invalid or missing thread_id: {thread_id}")
+            if not message_id or len(message_id) < 10:
+                logger.warning(f"Invalid or missing message_id: {message_id}")
 
-            message = email.mime.text.MIMEText(body)
-            message['To'] = to
-            message['Subject'] = f"Re: {subject}"
-            message['From'] = self.email_address
+            # Check for duplicate reply
+            current_time = time.time()
+            dedup_key = f"{thread_id}:{message_id}"
+            last_sent_time = self.sent_replies.get(dedup_key, 0)
+            dedup_window = 300  # 5 minutes in seconds
+
+            if current_time - last_sent_time < dedup_window:
+                logger.info(f"Skipping duplicate reply to {to} for thread {thread_id}, last sent {(current_time - last_sent_time):.2f}s ago")
+                return {'message_id': None, 'status': 'skipped_duplicate'}
+
+            logger.info(f"Preparing reply to {to} with thread_id={thread_id}, message_id={message_id}")
+
+            message = email.mime.multipart.MIMEMultipart()
+            message['to'] = to
+            # Ensure subject starts with "Re:" (case-insensitive)
+            if not subject.lower().startswith('re:'):
+                subject = f"Re: {subject}"
+            message['subject'] = subject
+            message['from'] = self.email_address
             message['In-Reply-To'] = message_id
             message['References'] = message_id
-            message['Message-ID'] = email.utils.make_msgid()
-            message['Date'] = email.utils.formatdate(localtime=True)
 
-            raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
-            message_body = {
+            # Add body
+            message.attach(email.mime.text.MIMEText(body, 'plain'))
+
+            # Encode message
+            raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+            message_data = {
                 'raw': raw_message,
                 'threadId': thread_id
             }
 
             sent_message = self.service.users().messages().send(
                 userId='me',
-                body=message_body
+                body=message_data
             ).execute()
 
+            # Update deduplication cache
+            self.sent_replies[dedup_key] = current_time
+            # Clean up old entries (older than dedup_window)
+            for key in list(self.sent_replies.keys()):
+                if current_time - self.sent_replies[key] > dedup_window:
+                    del self.sent_replies[key]
+
             logger.info(f"Sent reply to {to} for thread {thread_id}: {sent_message['id']}")
-            return sent_message
+            return {'message_id': sent_message['id']}
+
         except Exception as e:
             logger.error(f"Error sending reply to {to}: {str(e)}")
-            return None
+            raise  # Propagate the exception to ensure failure is reported correctly

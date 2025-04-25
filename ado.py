@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 import logging
 from semantic_kernel.functions import kernel_function
 import datetime
+import tempfile
+import base64
 
 # Configure logging
 logging.basicConfig(
@@ -33,19 +35,20 @@ class ADOPlugin:
         return self.client.get_all_work_items()
 
     @kernel_function(
-        description="Create a new work item in Azure DevOps.",
+        description="Create a new work item in Azure DevOps with optional email attachment.",
         name="create_ticket"
     )
-    async def create_ticket(self, title: str, description: str) -> dict:
+    async def create_ticket(self, title: str, description: str, email_content: str = None) -> dict:
         """
-        Create an ADO ticket.
+        Create an ADO ticket with an optional email attachment.
         Args:
             title (str): Ticket title.
             description (str): Ticket description.
+            email_content (str): Raw email content to attach (optional).
         Returns:
             dict: Ticket details {id, url} or None if failed.
         """
-        return self.client.create_ticket(title, description)
+        return self.client.create_ticket(title, description, email_content)
 
     @kernel_function(
         description="Update an Azure DevOps ticket with status and comment.",
@@ -96,8 +99,8 @@ class ADOClient:
             logger.error(f"Failed to initialize ADO connection: {str(e)}")
             raise
 
-    def create_ticket(self, title, description):
-        """Create a new work item in Azure DevOps."""
+    def create_ticket(self, title, description, email_content=None):
+        """Create a new work item in Azure DevOps with optional email attachment."""
         try:
             document = [
                 {
@@ -126,10 +129,64 @@ class ADOClient:
                 "url": f"{self.organization_url}/{self.project}/_workitems/edit/{work_item.id}"
             }
             logger.info(f"Created ADO work item: ID={ticket['id']}, Title={title}")
+
+            # Attach email if provided
+            if email_content:
+                attachment_url = self._upload_attachment(email_content, f"email_{work_item.id}.eml")
+                if attachment_url:
+                    document = [
+                        {
+                            "op": "add",
+                            "path": "/relations/-",
+                            "value": {
+                                "rel": "AttachedFile",
+                                "url": attachment_url,
+                                "attributes": {"comment": "Email associated with the ticket"}
+                            }
+                        }
+                    ]
+                    self.client.update_work_item(
+                        document=document,
+                        id=work_item.id,
+                        project=self.project
+                    )
+                    logger.info(f"Attached email to ADO work item: ID={work_item.id}")
+
             return ticket
         except Exception as e:
             logger.error(f"Error creating ADO ticket: {str(e)}")
             return None
+
+    def _upload_attachment(self, content, filename):
+        """Upload a file as an attachment to Azure DevOps."""
+        temp_file_path = None
+        try:
+            # Create a temporary file and write content
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".eml", mode='w', encoding='utf-8') as temp_file:
+                temp_file.write(content)
+                temp_file_path = temp_file.name
+
+            # Reopen the file in binary mode for uploading
+            with open(temp_file_path, 'rb') as file:
+                attachment = self.client.create_attachment(
+                    upload_stream=file,
+                    file_name=filename,
+                    upload_type="Simple",
+                    project=self.project
+                )
+                logger.info(f"Uploaded attachment: {filename}")
+                return attachment.url
+        except Exception as e:
+            logger.error(f"Error uploading attachment {filename}: {str(e)}")
+            return None
+        finally:
+            # Clean up the temporary file
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.unlink(temp_file_path)
+                    logger.info(f"Deleted temporary file: {temp_file_path}")
+                except Exception as e:
+                    logger.error(f"Error deleting temporary file {temp_file_path}: {str(e)}")
 
     def get_all_work_items(self):
         """Fetch all work items in the project using WIQL."""

@@ -38,7 +38,9 @@ class SKAgent:
             prompt = (
                 "You are an IT support assistant analyzing an email to determine the user's intent. "
                 "Classify the intent as 'github_access_request', 'github_revoke_access', or 'general_it_request'. "
-                "Determine if the request is a single action or involves multiple/pending actions. "
+                "For 'general_it_request', create a specific, detailed ticket description that summarizes the issue concisely but comprehensively. "
+                "Include any relevant technical details, error messages, or user-reported symptoms in the description. "
+                "Extract the username or requester name from the email sender address (before the @ symbol) if available. "
                 "Rules:\n"
                 "- GitHub access request:\n"
                 "  - Intent: 'github_access_request'.\n"
@@ -52,11 +54,11 @@ class SKAgent:
                 "  - Action: {'action': 'revoke_access', 'repo_name', 'github_username'}.\n"
                 "  - Pending actions: false (revocation typically completes the request).\n"
                 "  - Ticket description: e.g., 'Revoke access to poc for testuser9731'.\n"
-                "- Other IT support action:\n"
+                "  - Other IT support action:\n"
                 "  - Intent: 'general_it_request'.\n"
                 "  - Actions: [] (no specific actions).\n"
                 "  - Pending actions: false.\n"
-                "  - Ticket description: Summarize issue, e.g., 'Resolve VPN connection issue'.\n"
+                "  - Ticket description: Create a specific, detailed ticket description based on the email, e.g., 'User johndoe reports VPN connection error 0x8007274C when connecting to corporate network from Windows 10'.\n"
                 "- Unclear intent:\n"
                 "  - Intent: 'error'.\n"
                 "  - Actions: [].\n"
@@ -118,20 +120,22 @@ class SKAgent:
             update_text = "\n".join(update_content)
 
             prompt = (
-                "You are an IT support assistant analyzing Azure DevOps ticket updates. "
-                "Determine the intent of the updates (e.g., 'action_completed', 'additional_info_needed', 'issue_closed', 'access_revoked'). "
-                "Generate a polite email response addressing 'Dear User', including ticket ID, status, and comments. "
-                "If no comment, mention status change. For 'access_revoked', confirm access removal. "
+                "You are a helpful IT support admin writing a personalized email reply to a user. "
+                "Create a natural, conversational response as if you're a real IT support person named Agent. "
+                "Avoid robotic language or mentioning you're analyzing updates. "
+                "Include ticket ID, current status, and key information from the updates. "
+                "Sound friendly and helpful, use first-person, and vary your language. "
+                "Keep it concise but complete. Mention ticket status in a casual way. "
                 "Return JSON: {'update_intent', 'email_response'}.\n\n"
                 f"Ticket Description: {ticket_description}\n"
                 f"Updates:\n{update_text}\n\n"
                 "Examples:\n"
                 "1. Updates: Comment: Access granted, Status: Doing, Revision: 2\n"
-                "   ```json\n{\"update_intent\": \"action_completed\", \"email_response\": \"Dear User,\\n\\nYour ticket (ID: {ticket_id}) has been updated. Access to the repository has been granted. Current status: Doing. Please inform us when the work is complete to revoke access.\\n\\nBest regards,\\nIT Support Team\"}\n```\n"
+                "   ```json\n{\"update_intent\": \"action_completed\", \"email_response\": \"Hi there,\\n\\nI've processed your request and granted the access you needed to the repository. Your ticket (#123) is still open as I'll need to revoke the access when you're done with your work - just let me know when that is.\\n\\nLet me know if you need anything else!\\n\\nThanks,\\nAgent\\nIT Support\"}\n```\n"
                 "2. Updates: Comment: Access revoked for testuser9731, Status: Done, Revision: 3\n"
-                "   ```json\n{\"update_intent\": \"access_revoked\", \"email_response\": \"Dear User,\\n\\nYour ticket (ID: {ticket_id}) has been updated. Access for testuser9731 has been revoked. Current status: Done.\\n\\nBest regards,\\nIT Support Team\"}\n```\n"
+                "   ```json\n{\"update_intent\": \"access_revoked\", \"email_response\": \"Hi,\\n\\nJust confirming that I've revoked access for testuser9731 as requested. Your ticket (#123) is now closed.\\n\\nIf you need anything else, just let me know.\\n\\nBest,\\nAgent\\nIT Support\"}\n```\n"
                 "3. Updates: Comment: No comment provided., Status: Done, Revision: 1\n"
-                "   ```json\n{\"update_intent\": \"issue_closed\", \"email_response\": \"Dear User,\\n\\nYour ticket (ID: {ticket_id}) has been resolved. Current status: Done.\\n\\nBest regards,\\nIT Support Team\"}\n```\n"
+                "   ```json\n{\"update_intent\": \"issue_closed\", \"email_response\": \"Hello,\\n\\nI'm writing to let you know that your support ticket (#123) has been resolved and closed.\\n\\nPlease feel free to reach out if you have any further questions or need additional assistance.\\n\\nRegards,\\nAgent\\nIT Support\"}\n```\n"
                 "Output format:\n"
                 "```json\n{\"update_intent\": \"<intent>\", \"email_response\": \"<response>\"}\n```"
             )
@@ -166,7 +170,7 @@ class SKAgent:
                 "email_response": email_response
             }
 
-    async def process_email(self, email: dict, broadcast, existing_ticket: dict = None) -> dict:
+    async def process_email(self, email: dict, broadcast, existing_ticket: dict = None, email_content: str = None) -> dict:
         """Process an email through the workflow: analyze, create/update ticket, perform actions, send reply."""
         try:
             email_id = email["id"]
@@ -269,8 +273,8 @@ class SKAgent:
                     "github": github_result,
                     "actions": [{"action": "revoke_access", "completed": github_result["success"]}],
                     "pending_actions": False,
-                    "intent": intent,  # Make sure to include the intent
-                    "github_details": github_revoke_details  # Include the GitHub details
+                    "intent": intent,
+                    "github_details": github_revoke_details
                 }
 
             # Handle new email
@@ -278,7 +282,8 @@ class SKAgent:
             ticket_result = await self.kernel.invoke(
                 self.kernel.plugins["ado"]["create_ticket"],
                 title=subject,
-                description=ticket_description
+                description=ticket_description,
+                email_content=email_content
             )
             if not ticket_result or not ticket_result.value:
                 logger.error(f"Failed to create ticket for email ID={email_id}")
@@ -325,9 +330,17 @@ class SKAgent:
                     "message": github_result["message"]
                 })
             else:
-                # Update ticket for general IT request
+                # Update ticket for general IT request with detailed description
                 status = "To Do"
-                comment = "Ticket created for general IT request"
+                comment = ticket_description  # Using the detailed description from analyze_intent
+                
+                # Extract sender username (text before @ in email)
+                sender_username = sender.split('@')[0] if '@' in sender else sender
+                
+                # Update ticket description to include requester if not already mentioned
+                if sender_username.lower() not in ticket_description.lower():
+                    ticket_description = f"User {sender_username}: {ticket_description}"
+                
                 await self.kernel.invoke(
                     self.kernel.plugins["ado"]["update_ticket"],
                     ticket_id=ticket_id,
