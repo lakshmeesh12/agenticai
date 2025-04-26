@@ -92,12 +92,16 @@ async def process_emails():
                 for email in emails:
                     email_id = email["id"]
                     thread_id = email.get("threadId", email_id)
+                    attachments = email.get("attachments", [])
+                    temp_files = [a['path'] for a in attachments]  # Track temporary files
+                    
                     # Check if email is part of an existing thread
                     existing_ticket = tickets_collection.find_one({"thread_id": thread_id})
 
                     # Skip if the email ID has already been processed
                     if existing_ticket and existing_ticket["email_id"] == email_id:
                         logger.info(f"Email ID={email_id} already processed, skipping.")
+                        cleanup_temp_files(temp_files)
                         continue
 
                     # Construct email content for attachment (basic .eml format)
@@ -122,6 +126,9 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                     result = await agent.process_email(email, broadcast, existing_ticket, email_content)
                     logger.info(f"Agent result for email ID={email_id}: {result}")
                     
+                    # Clean up temporary files
+                    cleanup_temp_files(temp_files)
+                    
                     if result["status"] == "success":
                         ticket_id = result["ticket_id"]
                         intent = result.get("intent", "general_it_request")
@@ -129,11 +136,11 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                         pending_actions = result.get("pending_actions", False)
                         is_follow_up = bool(existing_ticket)
 
-                        # For debugging - let's log available fields in result
+                        # For debugging - log available fields in result
                         logger.info(f"Available fields in result: {list(result.keys())}")
 
                         # Email intent analysis for GitHub details
-                        email_intent_result = await agent.analyze_intent(email["subject"], email["body"])
+                        email_intent_result = await agent.analyze_intent(email["subject"], email["body"], attachments)
                         logger.info(f"Email intent analysis for GitHub details: {email_intent_result}")
                         
                         # Extract GitHub details from the intent analysis
@@ -143,6 +150,9 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                         
                         # If this is a new ticket (not a follow-up)
                         if not is_follow_up:
+                            # IMPORTANT: Save the original message_id for threading
+                            original_message_id = email_id
+                            
                             # Store new ticket in MongoDB
                             ticket_record = {
                                 "ado_ticket_id": ticket_id,
@@ -150,6 +160,7 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                 "subject": email["subject"],
                                 "thread_id": thread_id,
                                 "email_id": email_id,
+                                "original_message_id": original_message_id,  # Store for threading
                                 "ticket_description": email_intent_result.get("ticket_description", f"IT request for {email['subject']}"),
                                 "email_timestamp": datetime.now().isoformat(),
                                 "updates": [],
@@ -158,6 +169,11 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                 "type_of_request": "github" if intent.startswith("github_") else intent,
                                 "details": {}  # Initialize empty details dictionary
                             }
+                            
+                            # Store attachments in ticket record
+                            ticket_record["details"]["attachments"] = [
+                                {"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments
+                            ]
                             
                             # Handle GitHub specific fields if it's a GitHub access request
                             if intent == "github_access_request":
@@ -241,9 +257,11 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                 "ado_url": ado_url
                             })
                         else:
+                            # For follow-ups, retrieve the original message ID for proper threading
+                            original_message_id = existing_ticket.get("original_message_id", existing_ticket.get("email_id"))
+                            
                             # Handle follow-up emails based on intent
                             if intent.startswith("github_"):
-                                # GitHub follow-up handling remains unchanged
                                 # Common fields for both access and revoke operations
                                 comment = ""
                                 status = "pending"  # Start with pending status
@@ -325,6 +343,29 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                         array_filters=[{"elem.username": github_details["username"], "elem.request_type": intent}]
                                     )
                                     
+                                    # Send email update
+                                    update_body = f"Hi,\n\nI've processed your additional GitHub access request for {github_username} to {repo_name}. {new_comment}\n\nIf you need anything else, let me know!\n\nBest,\nAgent\nIT Support"
+                                    email_result = await send_ticket_update_email(
+                                        kernel,
+                                        to=existing_ticket["sender"],
+                                        subject=existing_ticket["subject"],
+                                        body=update_body,
+                                        thread_id=existing_ticket["thread_id"],
+                                        message_id=original_message_id
+                                    )
+                                    
+                                    # Update MongoDB to record email sent
+                                    if email_result["message_id"]:
+                                        tickets_collection.update_one(
+                                            {"ado_ticket_id": ticket_id, "updates.revision_id": f"git-result-{ticket_id}-{len(existing_ticket.get('updates', []))}"},
+                                            {
+                                                "$set": {
+                                                    "updates.$.email_sent": True,
+                                                    "updates.$.email_message_id": email_result["message_id"]
+                                                }
+                                            }
+                                        )
+                                
                                 elif intent == "github_revoke_access":
                                     # Similar approach for revoke operations
                                     github_details = {
@@ -396,6 +437,29 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                         },
                                         array_filters=[{"elem.username": github_details["username"], "elem.request_type": intent}]
                                     )
+                                    
+                                    # Send email update
+                                    update_body = f"Hi,\n\nI've processed your request to revoke access for {github_username} from {repo_name}. {new_comment}\n\nIf you need anything else, let me know!\n\nBest,\nAgent\nIT Support"
+                                    email_result = await send_ticket_update_email(
+                                        kernel,
+                                        to=existing_ticket["sender"],
+                                        subject=existing_ticket["subject"],
+                                        body=update_body,
+                                        thread_id=existing_ticket["thread_id"],
+                                        message_id=original_message_id
+                                    )
+                                    
+                                    # Update MongoDB to record email sent
+                                    if email_result["message_id"]:
+                                        tickets_collection.update_one(
+                                            {"ado_ticket_id": ticket_id, "updates.revision_id": f"git-result-{ticket_id}-{len(existing_ticket.get('updates', []))}"},
+                                            {
+                                                "$set": {
+                                                    "updates.$.email_sent": True,
+                                                    "updates.$.email_message_id": email_result["message_id"]
+                                                }
+                                            }
+                                        )
                                 
                                 # Broadcast updated status
                                 await broadcast({
@@ -446,6 +510,29 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                     update_operation
                                 )
                                 
+                                # Send email update
+                                update_body = f"Hi,\n\nThanks for the update on your IT request (Ticket #{ticket_id}). We're still working on it and have noted your latest information: {comment}\n\nI'll keep you posted on our progress.\n\nBest,\nAgent\nIT Support"
+                                email_result = await send_ticket_update_email(
+                                    kernel,
+                                    to=existing_ticket["sender"],
+                                    subject=existing_ticket["subject"],
+                                    body=update_body,
+                                    thread_id=existing_ticket["thread_id"],
+                                    message_id=original_message_id
+                                )
+                                
+                                # Update MongoDB to record email sent
+                                if email_result["message_id"]:
+                                    tickets_collection.update_one(
+                                        {"ado_ticket_id": ticket_id, "updates.revision_id": f"general-update-{ticket_id}-{len(existing_ticket.get('updates', []))}"},
+                                        {
+                                            "$set": {
+                                                "updates.$.email_sent": True,
+                                                "updates.$.email_message_id": email_result["message_id"]
+                                            }
+                                        }
+                                    )
+                                
                                 # Broadcast updated status
                                 await broadcast({
                                     "type": "ticket_updated",
@@ -460,7 +547,7 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                             else:
                                 # Handle other non-GitHub follow-up intents
                                 logger.info(f"Processing non-GitHub follow-up for intent: {intent}")
-                                # Add your logic for handling other types of follow-ups here
+                                # Add logic for other intents if needed
                     else:
                         logger.error(f"Failed to process email ID={email_id}: {result['message']}")
                         await broadcast({
@@ -473,6 +560,27 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
         except Exception as e:
             logger.error(f"Error in email processing loop: {str(e)}")
             await asyncio.sleep(10)
+
+async def send_ticket_update_email(kernel, to, subject, body, thread_id, message_id):
+    """Send an email update as a reply in the same thread as the original email."""
+    try:
+        # Add a context line to make it clear this is an update
+        update_body = body
+        
+        email_result = await kernel.invoke(
+            kernel.plugins["email_sender"]["send_reply"],
+            to=to,
+            subject=subject,
+            body=update_body,
+            thread_id=thread_id,
+            message_id=message_id
+        )
+        
+        logger.info(f"Sent email update to {to}, message_id: {email_result.value['message_id']}")
+        return email_result.value
+    except Exception as e:
+        logger.error(f"Failed to send email update: {str(e)}")
+        return {"message_id": None, "status": "failed"}
 
 async def process_tickets():
     """Check for ADO ticket updates."""
@@ -500,7 +608,8 @@ async def process_tickets():
                 
                 if new_updates:
                     logger.info(f"Found {len(new_updates)} new updates for ticket ID={ticket_id}")
-                    update_result = await agent.analyze_ticket_update(ticket_id, new_updates)
+                    attachments = ticket.get("details", {}).get("attachments", [])
+                    update_result = await agent.analyze_ticket_update(ticket_id, new_updates, attachments)
                     
                     if update_result["update_intent"] != "error":
                         sender = ticket.get('sender', 'Unknown')
@@ -509,12 +618,14 @@ async def process_tickets():
                         email_id = ticket.get('email_id', str(uuid.uuid4()))
                         
                         reply_result = await kernel.invoke(
-                            kernel.plugins["email_sender"]["send_reply"],
+                            self.kernel.plugins["email_sender"]["send_reply"],
                             to=sender,
                             subject=subject,
                             body=update_result["email_response"],
                             thread_id=thread_id,
-                            message_id=email_id
+                            message_id=email_id,
+                            attachments=attachments,
+                            remediation=update_result["remediation"]
                         )
                         email_status = bool(reply_result and reply_result.value)
                         email_message_id = reply_result.value.get("message_id") if reply_result and reply_result.value else None

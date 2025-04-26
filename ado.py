@@ -35,20 +35,21 @@ class ADOPlugin:
         return self.client.get_all_work_items()
 
     @kernel_function(
-        description="Create a new work item in Azure DevOps with optional email attachment.",
+        description="Create a new work item in Azure DevOps with optional email and image attachments.",
         name="create_ticket"
     )
-    async def create_ticket(self, title: str, description: str, email_content: str = None) -> dict:
+    async def create_ticket(self, title: str, description: str, email_content: str = None, attachments: list = None) -> dict:
         """
-        Create an ADO ticket with an optional email attachment.
+        Create an ADO ticket with optional email and image attachments.
         Args:
             title (str): Ticket title.
             description (str): Ticket description.
-            email_content (str): Raw email content to attach (optional).
+            email_content (str): Raw email content to attach as .eml (optional).
+            attachments (list): List of attachment metadata (filename, path, mimeType) (optional).
         Returns:
             dict: Ticket details {id, url} or None if failed.
         """
-        return self.client.create_ticket(title, description, email_content)
+        return self.client.create_ticket(title, description, email_content, attachments)
 
     @kernel_function(
         description="Update an Azure DevOps ticket with status and comment.",
@@ -76,7 +77,7 @@ class ADOPlugin:
         Args:
             ticket_id (int): Ticket ID.
         Returns:
-            list: List of updates {comment, status, revision_id}.
+            list: List of updates {comment, status, revision_id, attachments}.
         """
         return self.client.get_ticket_updates(ticket_id)
 
@@ -99,8 +100,8 @@ class ADOClient:
             logger.error(f"Failed to initialize ADO connection: {str(e)}")
             raise
 
-    def create_ticket(self, title, description, email_content=None):
-        """Create a new work item in Azure DevOps with optional email attachment."""
+    def create_ticket(self, title, description, email_content=None, attachments=None):
+        """Create a new work item in Azure DevOps with optional email and image attachments."""
         try:
             document = [
                 {
@@ -126,13 +127,14 @@ class ADOClient:
             )
             ticket = {
                 "id": work_item.id,
-                "url": f"{self.organization_url}/{self.project}/_workitems/edit/{work_item.id}"
+                "url": f"{self.organization_url}/{self.project}/_workitems/edit/{work_item.id}",
+                "attachments": []
             }
             logger.info(f"Created ADO work item: ID={ticket['id']}, Title={title}")
 
             # Attach email if provided
             if email_content:
-                attachment_url = self._upload_attachment(email_content, f"email_{work_item.id}.eml")
+                attachment_url = self._upload_attachment(email_content, f"email_{work_item.id}.eml", is_eml=True)
                 if attachment_url:
                     document = [
                         {
@@ -150,21 +152,50 @@ class ADOClient:
                         id=work_item.id,
                         project=self.project
                     )
+                    ticket['attachments'].append({'filename': f"email_{work_item.id}.eml", 'url': attachment_url})
                     logger.info(f"Attached email to ADO work item: ID={work_item.id}")
+
+            # Attach images if provided
+            if attachments:
+                for attachment in attachments:
+                    attachment_url = self._upload_attachment(attachment['path'], attachment['filename'], is_eml=False)
+                    if attachment_url:
+                        document = [
+                            {
+                                "op": "add",
+                                "path": "/relations/-",
+                                "value": {
+                                    "rel": "AttachedFile",
+                                    "url": attachment_url,
+                                    "attributes": {"comment": f"Image attachment: {attachment['filename']}"}
+                                }
+                            }
+                        ]
+                        self.client.update_work_item(
+                            document=document,
+                            id=work_item.id,
+                            project=self.project
+                        )
+                        ticket['attachments'].append({'filename': attachment['filename'], 'url': attachment_url})
+                        logger.info(f"Attached image {attachment['filename']} to ADO work item: ID={work_item.id}")
 
             return ticket
         except Exception as e:
             logger.error(f"Error creating ADO ticket: {str(e)}")
             return None
 
-    def _upload_attachment(self, content, filename):
+    def _upload_attachment(self, content, filename, is_eml=False):
         """Upload a file as an attachment to Azure DevOps."""
         temp_file_path = None
         try:
-            # Create a temporary file and write content
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".eml", mode='w', encoding='utf-8') as temp_file:
-                temp_file.write(content)
-                temp_file_path = temp_file.name
+            if is_eml:
+                # For .eml, content is a string
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".eml", mode='w', encoding='utf-8') as temp_file:
+                    temp_file.write(content)
+                    temp_file_path = temp_file.name
+            else:
+                # For images, content is a file path
+                temp_file_path = content
 
             # Reopen the file in binary mode for uploading
             with open(temp_file_path, 'rb') as file:
@@ -180,8 +211,8 @@ class ADOClient:
             logger.error(f"Error uploading attachment {filename}: {str(e)}")
             return None
         finally:
-            # Clean up the temporary file
-            if temp_file_path and os.path.exists(temp_file_path):
+            # Clean up the temporary file for .eml
+            if is_eml and temp_file_path and os.path.exists(temp_file_path):
                 try:
                     os.unlink(temp_file_path)
                     logger.info(f"Deleted temporary file: {temp_file_path}")
@@ -234,7 +265,8 @@ class ADOClient:
                 updates.append({
                     "comment": comment,
                     "status": status,
-                    "revision_id": revision.rev
+                    "revision_id": revision.rev,
+                    "attachments": []  # Attachments handled in create_ticket
                 })
 
             logger.info(f"Fetched {len(updates)} updates for ticket ID={ticket_id}")

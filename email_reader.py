@@ -2,12 +2,13 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from google.auth.transport.requests import Request
+from google.auth.transport.requests import Request  # Added missing import
 from dotenv import load_dotenv
 import os
 import logging
 import base64
 from semantic_kernel.functions import kernel_function
+import tempfile
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -30,7 +31,7 @@ class EmailReaderPlugin:
         Args:
             limit (int): Maximum number of emails to fetch (default: 10).
         Returns:
-            list: List of dictionaries with email details (id, subject, from, received, body, threadId).
+            list: List of dictionaries with email details (id, subject, from, received, body, threadId, attachments).
         """
         return self.client.fetch_new_emails(limit)
 
@@ -106,6 +107,35 @@ class EmailClient:
         
         return body
 
+    def _extract_attachments(self, msg, message_id):
+        """Extract image attachments (PNG, JPEG) and save to temporary files."""
+        attachments = []
+        if 'parts' in msg['payload']:
+            for part in msg['payload']['parts']:
+                if part.get('filename') and part.get('mimeType', '').startswith('image/'):
+                    attachment_id = part['body'].get('attachmentId')
+                    if attachment_id:
+                        try:
+                            attachment = self.service.users().messages().attachments().get(
+                                userId='me', messageId=message_id, id=attachment_id
+                            ).execute()
+                            data = base64.urlsafe_b64decode(attachment['data'])
+                            filename = part['filename']
+                            mime_type = part['mimeType']
+                            # Save to temporary file
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as temp_file:
+                                temp_file.write(data)
+                                temp_path = temp_file.name
+                            attachments.append({
+                                'filename': filename,
+                                'mimeType': mime_type,
+                                'path': temp_path
+                            })
+                            logger.info(f"Saved attachment {filename} to {temp_path}")
+                        except Exception as e:
+                            logger.error(f"Error fetching attachment {part.get('filename')}: {str(e)}")
+        return attachments
+
     def fetch_new_emails(self, limit=10):
         """Fetch new (unread) emails from inbox."""
         try:
@@ -131,8 +161,9 @@ class EmailClient:
                 received = msg.get('internalDate', '')
 
                 body = self._extract_body(msg['payload'])
+                attachments = self._extract_attachments(msg, message['id'])
 
-                logger.info(f"Extracted email ID={message['id']}, Subject={subject}, Body={body[:100]}...")
+                logger.info(f"Extracted email ID={message['id']}, Subject={subject}, Body={body[:100]}..., Attachments={len(attachments)}")
 
                 emails.append({
                     "id": message['id'],
@@ -140,7 +171,8 @@ class EmailClient:
                     "from": from_addr,
                     "received": received,
                     "body": body,
-                    "threadId": msg.get('threadId', message['id'])
+                    "threadId": msg.get('threadId', message['id']),
+                    "attachments": attachments
                 })
 
                 try:

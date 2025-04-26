@@ -22,8 +22,8 @@ class SKAgent:
         )
         logger.info("Initialized SKAgent with AzureOpenAI client")
 
-    async def analyze_intent(self, subject: str, body: str) -> dict:
-        """Analyze email intent using Azure OpenAI."""
+    async def analyze_intent(self, subject: str, body: str, attachments: list = None) -> dict:
+        """Analyze email intent using Azure OpenAI, including attachment details."""
         try:
             # Clean HTML from body
             if "<html>" in body.lower():
@@ -31,16 +31,21 @@ class SKAgent:
             else:
                 body = body.strip()
 
-            logger.info(f"Analyzing intent - Subject: {subject}, Body: {body[:100]}...")
+            logger.info(f"Analyzing intent - Subject: {subject}, Body: {body[:100]}..., Attachments={len(attachments or [])}")
 
             content = f"Subject: {subject}\nBody: {body}"
+            if attachments:
+                attachment_info = "\nAttachments: " + ", ".join(a['filename'] for a in attachments)
+                content += attachment_info
 
             prompt = (
                 "You are an IT support assistant analyzing an email to determine the user's intent. "
                 "Classify the intent as 'github_access_request', 'github_revoke_access', or 'general_it_request'. "
                 "For 'general_it_request', create a specific, detailed ticket description that summarizes the issue concisely but comprehensively. "
+                "If attachments (e.g., screenshots) are present, include their details in the description (e.g., 'Includes screenshot error1.png showing VPN error'). "
                 "Include any relevant technical details, error messages, or user-reported symptoms in the description. "
                 "Extract the username or requester name from the email sender address (before the @ symbol) if available. "
+                "Do not suggest remediation steps. "
                 "Rules:\n"
                 "- GitHub access request:\n"
                 "  - Intent: 'github_access_request'.\n"
@@ -58,7 +63,7 @@ class SKAgent:
                 "  - Intent: 'general_it_request'.\n"
                 "  - Actions: [] (no specific actions).\n"
                 "  - Pending actions: false.\n"
-                "  - Ticket description: Create a specific, detailed ticket description based on the email, e.g., 'User johndoe reports VPN connection error 0x8007274C when connecting to corporate network from Windows 10'.\n"
+                "  - Ticket description: Create a specific, detailed ticket description based on the email, e.g., 'User johndoe reports VPN connection error 0x8007274C when connecting to corporate network from Windows 10. Includes screenshot error1.png showing error message.'.\n"
                 "- Unclear intent:\n"
                 "  - Intent: 'error'.\n"
                 "  - Actions: [].\n"
@@ -74,8 +79,8 @@ class SKAgent:
                 "   ```json\n{\"intent\": \"github_access_request\", \"ticket_description\": \"Grant read access to poc for testuser9731\", \"actions\": [{\"action\": \"grant_access\", \"repo_name\": \"poc\", \"access_type\": \"pull\", \"github_username\": \"testuser9731\"}, {\"action\": \"revoke_access\", \"repo_name\": \"poc\", \"github_username\": \"testuser9731\"}], \"pending_actions\": true, \"repo_name\": \"poc\", \"access_type\": \"pull\", \"github_username\": \"testuser9731\"}\n```\n"
                 "3. Subject: Revoke access to poc repo\nBody: Work is done. Revoke testuser9731 access to poc.\n"
                 "   ```json\n{\"intent\": \"github_revoke_access\", \"ticket_description\": \"Revoke access to poc for testuser9731\", \"actions\": [{\"action\": \"revoke_access\", \"repo_name\": \"poc\", \"github_username\": \"testuser9731\"}], \"pending_actions\": false, \"repo_name\": \"poc\", \"access_type\": \"unspecified\", \"github_username\": \"testuser9731\"}\n```\n"
-                "4. Subject: VPN issue\nBody: Can’t connect to VPN. Error: Invalid settings.\n"
-                "   ```json\n{\"intent\": \"general_it_request\", \"ticket_description\": \"Resolve VPN connection issue\", \"actions\": [], \"pending_actions\": false, \"repo_name\": \"unspecified\", \"access_type\": \"unspecified\", \"github_username\": \"unspecified\"}\n```\n"
+                "4. Subject: VPN issue\nBody: Can’t connect to VPN. Error: Invalid settings.\nAttachments: error1.png\n"
+                "   ```json\n{\"intent\": \"general_it_request\", \"ticket_description\": \"Resolve VPN connection issue. Includes screenshot error1.png showing error message.\", \"actions\": [], \"pending_actions\": false, \"repo_name\": \"unspecified\", \"access_type\": \"unspecified\", \"github_username\": \"unspecified\"}\n```\n"
                 "Output format:\n"
                 "```json\n{\"intent\": \"<intent>\", \"ticket_description\": \"<description>\", \"actions\": [<action_objects>], \"pending_actions\": <bool>, \"repo_name\": \"<repo>\", \"access_type\": \"<pull|push|unspecified>\", \"github_username\": \"<username>\"}\n```"
             )
@@ -103,14 +108,14 @@ class SKAgent:
                 "intent": "error",
                 "ticket_description": f"Error analyzing intent: {str(e)}",
                 "actions": [],
-                "pending_actions": false,
+                "pending_actions": False,
                 "repo_name": "unspecified",
                 "access_type": "unspecified",
                 "github_username": "unspecified"
             }
 
-    async def analyze_ticket_update(self, ticket_id: int, updates: list) -> dict:
-        """Analyze ADO ticket updates and generate email response."""
+    async def analyze_ticket_update(self, ticket_id: int, updates: list, attachments: list = None) -> dict:
+        """Analyze ADO ticket updates and generate email response with remediation if attachments are present."""
         try:
             ticket_description = f"Ticket ID: {ticket_id} - IT support request"
             update_content = [
@@ -118,26 +123,57 @@ class SKAgent:
                 for u in updates
             ]
             update_text = "\n".join(update_content)
+            attachment_info = ""
+            remediation = ""
+
+            if attachments:
+                attachment_info = f"Attachments: {', '.join(a['filename'] for a in attachments)}"
+                # Generate remediation steps based on attachments
+                remediation_prompt = (
+                    "You are an IT support assistant generating troubleshooting steps based on image attachments (e.g., screenshots of error messages). "
+                    "The images likely show IT-related errors (e.g., VPN, software, or network issues). "
+                    "Provide 3-5 concise, actionable steps to help the user troubleshoot the issue until further support is provided. "
+                    "Format as a numbered list. Do not reference specific image content since you can't view images. "
+                    "Example:\n"
+                    "1. Restart the application and try again.\n"
+                    "2. Check your internet connection and ensure it's stable.\n"
+                    "3. Update the software to the latest version.\n"
+                    "4. Clear the application cache.\n"
+                    f"Attachments: {', '.join(a['filename'] for a in attachments)}\n"
+                    "Return only the numbered list as plain text."
+                )
+                remediation_response = self.client.chat.completions.create(
+                    model=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
+                    messages=[
+                        {"role": "system", "content": "You are a helpful IT support assistant."},
+                        {"role": "user", "content": remediation_prompt}
+                    ],
+                    temperature=0.2,
+                    max_tokens=200
+                )
+                remediation = remediation_response.choices[0].message.content.strip()
 
             prompt = (
                 "You are a helpful IT support admin writing a personalized email reply to a user. "
                 "Create a natural, conversational response as if you're a real IT support person named Agent. "
                 "Avoid robotic language or mentioning you're analyzing updates. "
                 "Include ticket ID, current status, and key information from the updates. "
+                "If attachments are present, mention they are included for reference. "
                 "Sound friendly and helpful, use first-person, and vary your language. "
                 "Keep it concise but complete. Mention ticket status in a casual way. "
-                "Return JSON: {'update_intent', 'email_response'}.\n\n"
+                "Return JSON: {'update_intent', 'email_response', 'remediation'}.\n\n"
                 f"Ticket Description: {ticket_description}\n"
-                f"Updates:\n{update_text}\n\n"
+                f"Updates:\n{update_text}\n"
+                f"{attachment_info}\n\n"
                 "Examples:\n"
                 "1. Updates: Comment: Access granted, Status: Doing, Revision: 2\n"
-                "   ```json\n{\"update_intent\": \"action_completed\", \"email_response\": \"Hi there,\\n\\nI've processed your request and granted the access you needed to the repository. Your ticket (#123) is still open as I'll need to revoke the access when you're done with your work - just let me know when that is.\\n\\nLet me know if you need anything else!\\n\\nThanks,\\nAgent\\nIT Support\"}\n```\n"
+                "   ```json\n{\"update_intent\": \"action_completed\", \"email_response\": \"Hi there,\\n\\nI've processed your request and granted the access you needed to the repository. Your ticket (#123) is still open as I'll need to revoke the access when you're done with your work - just let me know when that is.\\n\\nLet me know if you need anything else!\\n\\nThanks,\\nAgent\\nIT Support\", \"remediation\": \"\"}\n```\n"
                 "2. Updates: Comment: Access revoked for testuser9731, Status: Done, Revision: 3\n"
-                "   ```json\n{\"update_intent\": \"access_revoked\", \"email_response\": \"Hi,\\n\\nJust confirming that I've revoked access for testuser9731 as requested. Your ticket (#123) is now closed.\\n\\nIf you need anything else, just let me know.\\n\\nBest,\\nAgent\\nIT Support\"}\n```\n"
-                "3. Updates: Comment: No comment provided., Status: Done, Revision: 1\n"
-                "   ```json\n{\"update_intent\": \"issue_closed\", \"email_response\": \"Hello,\\n\\nI'm writing to let you know that your support ticket (#123) has been resolved and closed.\\n\\nPlease feel free to reach out if you have any further questions or need additional assistance.\\n\\nRegards,\\nAgent\\nIT Support\"}\n```\n"
+                "   ```json\n{\"update_intent\": \"access_revoked\", \"email_response\": \"Hi,\\n\\nJust confirming that I've revoked access for testuser9731 as requested. Your ticket (#123) is now closed.\\n\\nIf you need anything else, just let me know.\\n\\nBest,\\nAgent\\nIT Support\", \"remediation\": \"\"}\n```\n"
+                "3. Updates: Comment: Investigating VPN issue, Status: Doing, Revision: 1\nAttachments: error1.png\n"
+                "   ```json\n{\"update_intent\": \"issue_pending\", \"email_response\": \"Hi,\\n\\nThanks for reporting the VPN issue. I've logged your ticket (#123) and we're looking into it. I've included your screenshot for reference. While I get back to you, you can try the steps below.\\n\\nBest,\\nAgent\\nIT Support\", \"remediation\": \"1. Restart your VPN client.\\n2. Ensure your internet connection is stable.\\n3. Update the VPN software to the latest version.\"}\n```\n"
                 "Output format:\n"
-                "```json\n{\"update_intent\": \"<intent>\", \"email_response\": \"<response>\"}\n```"
+                "```json\n{\"update_intent\": \"<intent>\", \"email_response\": \"<response>\", \"remediation\": \"<remediation>\"}\n```"
             )
 
             response = self.client.chat.completions.create(
@@ -155,6 +191,7 @@ class SKAgent:
                 result = result[7:-3].strip()
 
             parsed_result = json.loads(result)
+            parsed_result['remediation'] = remediation if remediation else parsed_result.get('remediation', '')
             logger.info(f"Analyzed ticket update intent for ticket ID={ticket_id}: {parsed_result['update_intent']}")
             return parsed_result
         except Exception as e:
@@ -167,7 +204,8 @@ class SKAgent:
             )
             return {
                 "update_intent": "error",
-                "email_response": email_response
+                "email_response": email_response,
+                "remediation": ""
             }
 
     async def process_email(self, email: dict, broadcast, existing_ticket: dict = None, email_content: str = None) -> dict:
@@ -178,6 +216,7 @@ class SKAgent:
             body = email["body"]
             sender = email["from"]
             thread_id = email.get("threadId", email_id)
+            attachments = email.get("attachments", [])
             is_follow_up = bool(existing_ticket)
 
             # Broadcast email detection
@@ -189,7 +228,7 @@ class SKAgent:
             })
 
             # Analyze intent
-            intent_result = await self.analyze_intent(subject, body)
+            intent_result = await self.analyze_intent(subject, body, attachments)
             intent = intent_result["intent"]
             ticket_description = intent_result["ticket_description"]
             actions = intent_result["actions"]
@@ -247,8 +286,9 @@ class SKAgent:
                     ticket_id=ticket_id
                 )
                 updates = updates_result.value if updates_result else []
-                update_result = await self.analyze_ticket_update(ticket_id, updates)
+                update_result = await self.analyze_ticket_update(ticket_id, updates, attachments)
                 email_response = update_result["email_response"]
+                remediation = update_result["remediation"]
 
                 reply_result = await self.kernel.invoke(
                     self.kernel.plugins["email_sender"]["send_reply"],
@@ -256,7 +296,9 @@ class SKAgent:
                     subject=subject,
                     body=email_response,
                     thread_id=thread_id,
-                    message_id=email_id
+                    message_id=email_id,
+                    attachments=attachments,
+                    remediation=remediation
                 )
                 reply = reply_result.value if reply_result else None
 
@@ -283,7 +325,8 @@ class SKAgent:
                 self.kernel.plugins["ado"]["create_ticket"],
                 title=subject,
                 description=ticket_description,
-                email_content=email_content
+                email_content=email_content,
+                attachments=attachments
             )
             if not ticket_result or not ticket_result.value:
                 logger.error(f"Failed to create ticket for email ID={email_id}")
@@ -354,8 +397,9 @@ class SKAgent:
                 ticket_id=ticket_id
             )
             updates = updates_result.value if updates_result else []
-            update_result = await self.analyze_ticket_update(ticket_id, updates)
+            update_result = await self.analyze_ticket_update(ticket_id, updates, attachments)
             email_response = update_result["email_response"]
+            remediation = update_result["remediation"]
 
             reply_result = await self.kernel.invoke(
                 self.kernel.plugins["email_sender"]["send_reply"],
@@ -363,7 +407,9 @@ class SKAgent:
                 subject=subject,
                 body=email_response,
                 thread_id=thread_id,
-                message_id=email_id
+                message_id=email_id,
+                attachments=attachments,
+                remediation=remediation
             )
             reply = reply_result.value if reply_result else None
 

@@ -9,6 +9,8 @@ import base64
 from semantic_kernel.functions import kernel_function
 import email.mime.text
 import email.mime.multipart
+import email.mime.base
+from email import encoders
 import time
 from collections import defaultdict
 
@@ -25,10 +27,10 @@ class EmailSenderPlugin:
         logger.info("Initialized Gmail send service")
 
     @kernel_function(
-        description="Send an email reply to a recipient.",
+        description="Send an email reply to a recipient with optional attachments and remediation.",
         name="send_reply"
     )
-    async def send_reply(self, to: str, subject: str, body: str, thread_id: str, message_id: str) -> dict:
+    async def send_reply(self, to: str, subject: str, body: str, thread_id: str, message_id: str, attachments: list = None, remediation: str = None) -> dict:
         """
         Send an email reply.
         Args:
@@ -37,10 +39,12 @@ class EmailSenderPlugin:
             body (str): Email body.
             thread_id (str): Thread ID for reply.
             message_id (str): Message ID for In-Reply-To header.
+            attachments (list): List of attachment metadata (filename, path, mimeType) (optional).
+            remediation (str): Remediation steps to include in the body (optional).
         Returns:
             dict: {'message_id': str} or None if failed or skipped due to deduplication.
         """
-        return self.client.send_reply(to, subject, body, thread_id, message_id)
+        return self.client.send_reply(to, subject, body, thread_id, message_id, attachments, remediation)
 
 class EmailSenderClient:
     def __init__(self):
@@ -69,13 +73,20 @@ class EmailSenderClient:
                 with open(token_path, 'w') as token:
                     token.write(creds.to_json())
 
-            self.service = build('gmail', 'v1', credentials=creds)
+            # Configure null cache to suppress oauth2client warning
+            from googleapiclient.discovery_cache.base import Cache
+            class NullCache(Cache):
+                def get(self, url): pass
+                def set(self, url, content): pass
+            discovery_cache = NullCache()
+
+            self.service = build('gmail', 'v1', credentials=creds, cache=discovery_cache)
             logger.info(f"Authenticated to {self.email_address} for sending")
         except Exception as e:
             logger.error(f"Failed to initialize Gmail send service: {str(e)}")
             raise
 
-    def send_reply(self, to, subject, body, thread_id, message_id):
+    def send_reply(self, to, subject, body, thread_id, message_id, attachments=None, remediation=None):
         """Send an email reply, skipping duplicates within a time window."""
         try:
             # Validate thread_id and message_id
@@ -106,8 +117,30 @@ class EmailSenderClient:
             message['In-Reply-To'] = message_id
             message['References'] = message_id
 
+            # Append remediation if provided
+            if remediation:
+                body += f"\n\nWhile I get back to you, you can try these steps:\n{remediation}"
+
             # Add body
             message.attach(email.mime.text.MIMEText(body, 'plain'))
+
+            # Add attachments
+            if attachments:
+                for attachment in attachments:
+                    try:
+                        with open(attachment['path'], 'rb') as f:
+                            part = email.mime.base.MIMEBase(*attachment['mimeType'].split('/'))
+                            part.set_payload(f.read())
+                        encoders.encode_base64(part)
+                        part.add_header(
+                            'Content-Disposition',
+                            f'attachment; filename={attachment["filename"]}'
+                        )
+                        message.attach(part)
+                        logger.info(f"Attached {attachment['filename']} to reply")
+                    except Exception as e:
+                        logger.warning(f"Skipping attachment {attachment['filename']}: {str(e)}")
+                        continue
 
             # Encode message
             raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
