@@ -349,6 +349,43 @@ tbody tr:hover {
   box-shadow: 0 6px 15px rgba(0, 0, 0, 0.2);
 }
 
+.admin-request {
+  margin-bottom: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.admin-request-input {
+  width: 100%;
+  padding: 10px;
+  border: 1px solid #ccc;
+  border-radius: 5px;
+  font-size: 14px;
+  resize: vertical;
+}
+
+.send-request-button {
+  padding: 10px 20px;
+  border: none;
+  background-color: #0078d4;
+  color: white;
+  border-radius: 5px;
+  cursor: pointer;
+  font-weight: 500;
+  align-self: flex-end;
+  transition: background-color 0.2s;
+}
+
+.send-request-button:hover {
+  background-color: #005fa9;
+}
+
+.send-request-button:disabled {
+  background-color: #cccccc;
+  cursor: not-allowed;
+}
+
 /* Modal Styling - Fixed positioning and size */
 .modal-container {
   position: fixed;
@@ -373,6 +410,33 @@ tbody tr:hover {
   box-shadow: 0 5px 20px rgba(0, 0, 0, 0.3);
   position: relative;
   animation: modalAppear 0.3s ease-out;
+}
+
+/* Spam modal styling */
+.spam-modal {
+  background-color: #fff8f8;
+  border: 2px solid #cc0000;
+  box-shadow: 0 5px 20px rgba(204, 0, 0, 0.3);
+}
+
+.spam-modal h3 {
+  color: #cc0000 !important;
+  background-color: #ffebeb;
+  padding: 10px !important;
+  margin: -25px -25px 15px -25px !important;
+  border-radius: 10px 10px 0 0;
+  text-align: center;
+}
+
+.alert-step {
+  background-color: #ffebeb;
+  padding: 10px;
+  border-radius: 5px;
+  border-left: 4px solid #cc0000;
+}
+
+.alert-step strong {
+  color: #cc0000;
 }
 
 @keyframes modalAppear {
@@ -421,9 +485,25 @@ tbody tr:hover {
   transition: background-color 0.2s;
 }
 
+.spam-modal .modal-close {
+  background-color: #cc0000;
+}
+
+.spam-modal .modal-close:hover {
+  background-color: #aa0000;
+}
+
 .modal-close:hover {
   background-color: #005fa9;
 }
+
+/* Timeline events styling for security alerts */
+.timeline-event .timeline-text:has(span.security-alert) {
+  color: #cc0000;
+  font-weight: bold;
+}
+
+/* Rest of your existing CSS */
 
 /* Responsive Design */
 @media (max-width: 920px) {

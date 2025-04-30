@@ -9,9 +9,10 @@ const App = () => {
   const [timelineEvents, setTimelineEvents] = useState([]);
   const [tickets, setTickets] = useState([]);
   const [logs, setLogs] = useState([]);
-  const [search, setSearch] = useState('');
-  const [wsError, setWsError] = useState(null);
+  const [adminRequest, setAdminRequest] = useState('');
+  const [isSending, setIsSending] = useState(false);
   const [modals, setModals] = useState([]);
+  const [wsError, setWsError] = useState(null);
   const [githubMetrics, setGithubMetrics] = useState({
     byRequestType: [],
     summary: { access: 0, revoke: 0, success: 0, pending: 0, failed: 0 }
@@ -44,20 +45,70 @@ const App = () => {
             return prev;
           });
         } else if (message.type === 'email_detected') {
+          const isValidDomain = message.is_valid_domain !== false;
           setModals((prev) => {
             if (!prev.some((m) => m.email_id === message.email_id)) {
               return [
                 ...prev,
                 {
                   email_id: message.email_id,
-                  steps: [{ status: 'New email arrived', details: `Subject: ${message.subject}, From: ${message.sender}` }],
-                  show: true
+                  steps: [{
+                    status: 'New email arrived',
+                    details: `Subject: ${message.subject}, From: ${message.sender}${!isValidDomain ? ' - UNAUTHORIZED DOMAIN' : ''}`
+                  }],
+                  show: true,
+                  isSpam: !isValidDomain
                 }
               ];
             }
             return prev;
           });
-          const eventText = `New email: ${message.subject}`;
+          const eventText = `New email: ${message.subject}${!isValidDomain ? ' - UNAUTHORIZED DOMAIN' : ''}`;
+          setTimelineEvents((prev) => {
+            if (!prev.some((e) => e.event === eventText)) {
+              return [...prev, { time: new Date().toLocaleTimeString(), event: eventText }];
+            }
+            return prev;
+          });
+        } else if (message.type === 'spam_alert') {
+          setModals((prev) => {
+            const existingModalIndex = prev.findIndex(m => m.email_id === message.email_id);
+            if (existingModalIndex !== -1) {
+              const updatedModals = [...prev];
+              updatedModals[existingModalIndex] = {
+                ...updatedModals[existingModalIndex],
+                steps: [
+                  ...updatedModals[existingModalIndex].steps,
+                  {
+                    status: 'SECURITY ALERT',
+                    details: `<span style="color: #cc0000; font-weight: bold;">⚠️ ${message.message}</span>`
+                  }
+                ],
+                isSpam: true
+              };
+              return updatedModals;
+            } else {
+              return [
+                ...prev,
+                {
+                  email_id: message.email_id,
+                  steps: [
+                    {
+                      status: 'New email arrived',
+                      details: `Subject: ${message.subject}, From: ${message.sender} - UNAUTHORIZED DOMAIN`
+                    },
+                    {
+                      status: 'SECURITY ALERT',
+                      details: `<span style="color: #cc0000; font-weight: bold;">⚠️ ${message.message}</span>`
+                    }
+                  ],
+                  show: true,
+                  isSpam: true
+                }
+              ];
+            }
+          });
+          const eventText = `SECURITY ALERT: ${message.message}`;
           setTimelineEvents((prev) => {
             if (!prev.some((e) => e.event === eventText)) {
               return [...prev, { time: new Date().toLocaleTimeString(), event: eventText }];
@@ -267,9 +318,7 @@ const App = () => {
   // Process GitHub data for visualization
   useEffect(() => {
     const processGitHubData = () => {
-      // Get all GitHub-related tickets
       const githubTickets = tickets.filter(ticket => ticket.type_of_request === 'github' && ticket.details && ticket.details.github);
-      
       const typeMap = new Map();
       let accessCount = 0;
       let revokeCount = 0;
@@ -279,38 +328,27 @@ const App = () => {
 
       githubTickets.forEach(ticket => {
         if (!ticket.details || !ticket.details.github) return;
-        
         ticket.details.github.forEach(request => {
-          // Count by request type
           const requestType = request.request_type === 'github_access_request' ? 'Access' : 'Revoke';
           if (!typeMap.has(requestType)) {
             typeMap.set(requestType, { name: requestType, count: 0 });
           }
           typeMap.get(requestType).count += 1;
-          
-          // Update summary counts
           if (request.request_type === 'github_access_request') {
             accessCount++;
           } else if (request.request_type === 'github_revoke_access') {
             revokeCount++;
           }
-          
-          // Fix the status counting logic
           if (request.status === 'pending') {
             pendingCount++;
           } else if (request.status === 'completed' || request.status === 'revoked') {
-            // Count both "completed" and "revoked" as success
             successCount++;
-          } else if (request.status.includes('error') || request.status.includes('failed')) {
-            failedCount++;
           } else {
-            // Any other status also counted as failed for now
             failedCount++;
           }
         });
       });
-      
-      // Set the metrics state
+
       setGithubMetrics({
         byRequestType: Array.from(typeMap.values()),
         summary: {
@@ -322,7 +360,7 @@ const App = () => {
         }
       });
     };
-    
+
     if (tickets && tickets.length > 0) {
       processGitHubData();
     }
@@ -340,7 +378,6 @@ const App = () => {
         setTickets(ticketsRes.data.tickets || []);
         setLogs(logsRes.data.logs || []);
 
-        // Update timeline with ticket events, avoiding duplicates
         (ticketsRes.data.tickets || []).forEach((ticket) => {
           const ticketEvent = `Created ADO ticket ID=${ticket.ado_ticket_id}`;
           if (!timelineEvents.some((e) => e.event === ticketEvent)) {
@@ -401,21 +438,85 @@ const App = () => {
     }
   };
 
+  // Handle sending admin request
+  const handleSendRequest = async () => {
+    if (!adminRequest.trim()) {
+      alert('Please enter a request.');
+      return;
+    }
+
+    // Extract ticket ID from request (basic regex to find a number)
+    const ticketIdMatch = adminRequest.match(/\b(\d+)\b/);
+    const ticketId = ticketIdMatch ? parseInt(ticketIdMatch[0]) : null;
+
+    if (!ticketId) {
+      setModals((prev) => [
+        ...prev,
+        {
+          email_id: `admin-request-${Date.now()}`,
+          steps: [
+            { status: 'Error', details: 'No valid ticket ID found in the request. Please include a ticket ID.' }
+          ],
+          show: true,
+          isSpam: false
+        }
+      ]);
+      return;
+    }
+
+    setIsSending(true);
+    try {
+      const res = await axios.post('http://localhost:8000/send-request', {
+        ticket_id: ticketId,
+        request: adminRequest
+      });
+
+      setModals((prev) => [
+        ...prev,
+        {
+          email_id: `admin-request-${Date.now()}`,
+          steps: [
+            { status: 'Admin Request', details: adminRequest },
+            {
+              status: res.data.summary_intent === 'error' ? 'Error' : 'Response',
+              details: res.data.response.replace(/\n/g, '<br>')
+            }
+          ],
+          show: true,
+          isSpam: false
+        }
+      ]);
+      setAdminRequest('');
+    } catch (error) {
+      console.error('Error sending admin request:', error);
+      setModals((prev) => [
+        ...prev,
+        {
+          email_id: `admin-request-${Date.now()}`,
+          steps: [
+            { status: 'Admin Request', details: adminRequest },
+            { status: 'Error', details: `Failed to process request: ${error.response?.data?.detail || error.message}` }
+          ],
+          show: true,
+          isSpam: false
+        }
+      ]);
+    } finally {
+      setIsSending(false);
+    }
+  };
+
   // Close a specific modal
   const closeModal = (email_id) => {
     setModals((prev) => prev.filter((modal) => modal.email_id !== email_id));
   };
 
-  // Filter tickets based on search
-  const filteredTickets = tickets.filter(
-    (ticket) =>
-      ticket.ado_ticket_id.toString().includes(search) ||
-      (ticket.subject || '').toLowerCase().includes(search.toLowerCase())
-  );
+  // Filter tickets (no longer filtered by search, but kept for potential future use)
+  const filteredTickets = tickets;
 
   // Colors for charts
   const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884d8'];
-  
+
   // Custom formatter for the Legend labels
   const renderColorfulLegendText = (value, entry) => {
     const { color } = entry;
@@ -439,13 +540,20 @@ const App = () => {
           {modals.map((modal) => (
             <div
               key={modal.email_id}
-              className="modal"
+              className={`modal ${modal.isSpam ? 'spam-modal' : ''}`}
             >
               <div className="modal-content">
-                <h3>Email Processing Workflow (Email ID: {modal.email_id})</h3>
+                <h3>
+                  {modal.isSpam
+                    ? '⚠️ Unauthorized Email Alert ⚠️'
+                    : modal.steps.some(step => step.status === 'Admin Request')
+                      ? 'Admin Request Response'
+                      : 'Email Processing Workflow'}
+                  (ID: {modal.email_id})
+                </h3>
                 <ul>
                   {modal.steps.map((step, stepIndex) => (
-                    <li key={stepIndex} className="modal-step">
+                    <li key={stepIndex} className={`modal-step ${step.status === 'SECURITY ALERT' ? 'alert-step' : ''}`}>
                       <strong>{step.status}:</strong> <span dangerouslySetInnerHTML={{ __html: step.details }} />
                     </li>
                   ))}
@@ -495,13 +603,22 @@ const App = () => {
         {/* Dashboard */}
         <div className="dashboard">
           <h2>Dashboard</h2>
-          <input
-            type="text"
-            placeholder="Search by Ticket ID or Subject"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            className="search-input"
-          />
+          <div className="admin-request">
+            <textarea
+              placeholder="Enter your request (e.g., Can you give a quick summary for ticket ID 145?)"
+              value={adminRequest}
+              onChange={(e) => setAdminRequest(e.target.value)}
+              className="admin-request-input"
+              rows="4"
+            />
+            <button
+              onClick={handleSendRequest}
+              className="send-request-button"
+              disabled={isSending}
+            >
+              {isSending ? 'Sending...' : 'Send Request'}
+            </button>
+          </div>
 
           {/* GitHub Metrics Dashboard */}
           <div className="github-dashboard">
@@ -527,7 +644,7 @@ const App = () => {
                       ))}
                     </Pie>
                     <Tooltip />
-                    <Legend 
+                    <Legend
                       formatter={renderColorfulLegendText}
                       layout="horizontal"
                       verticalAlign="bottom"
@@ -546,7 +663,7 @@ const App = () => {
                   </div>
                 </div>
               </div>
-              
+
               {/* Status Distribution */}
               <div className="chart-container">
                 <h4>Request Status</h4>
@@ -571,7 +688,7 @@ const App = () => {
                       <Cell fill="#FF8042" />
                     </Pie>
                     <Tooltip />
-                    <Legend 
+                    <Legend
                       formatter={renderColorfulLegendText}
                       layout="horizontal"
                       verticalAlign="bottom"
