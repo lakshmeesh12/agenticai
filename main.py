@@ -78,7 +78,7 @@ async def process_emails():
     kernel.add_plugin(EmailSenderPlugin(), plugin_name="email_sender")
     kernel.add_plugin(ADOPlugin(), plugin_name="ado")
     kernel.add_plugin(GitPlugin(), plugin_name="git")
-    agent = SKAgent(kernel, tickets_collection)  # Pass tickets_collection
+    agent = SKAgent(kernel, tickets_collection)
     logger.info(f"Registered plugins: {list(kernel.plugins.keys())}")
 
     valid_domain = "@quadranttechnologies.com"
@@ -107,7 +107,7 @@ async def process_emails():
                     await broadcast({
                         "type": "email_detected",
                         "subject": email['subject'],
-                        "sender": email.get("from", "Unknown"),
+                        "sender": sender_email,
                         "email_id": email_id,
                         "is_valid_domain": is_valid_domain
                     })
@@ -118,13 +118,13 @@ async def process_emails():
                             "type": "spam_alert",
                             "email_id": email_id,
                             "subject": email['subject'],
-                            "sender": email.get("from", "Unknown"),
+                            "sender": sender_email,
                             "message": f"Email rejected: Sender not from authorized domain"
                         })
                         cleanup_temp_files(temp_files)
                         continue
                     
-                    logger.info(f"Processing email - Subject: {email['subject']}, From: {email.get('from', 'Unknown')}")
+                    logger.info(f"Processing email - Subject: {email['subject']}, From: {sender_email}")
 
                     existing_ticket = tickets_collection.find_one({"thread_id": thread_id})
 
@@ -133,7 +133,7 @@ async def process_emails():
                         cleanup_temp_files(temp_files)
                         continue
 
-                    email_content = f"""From: {email.get('from', 'Unknown')}
+                    email_content = f"""From: {sender_email}
 Subject: {email['subject']}
 Date: {email.get('received', datetime.now().isoformat())}
 To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
@@ -147,7 +147,7 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
 
                     email_chain_entry = {
                         "email_id": email_id,
-                        "from": email.get("from", "Unknown"),
+                        "from": sender_email,
                         "subject": email["subject"],
                         "body": email["body"],
                         "timestamp": email.get("received", datetime.now().isoformat()),
@@ -157,6 +157,34 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                         ]
                     }
 
+                    # Handle non-intent emails
+                    if intent == "non_intent":
+                        logger.info(f"Non-intent email detected (ID={email_id}). Adding to email_chain and stopping processing.")
+                        if existing_ticket:
+                            tickets_collection.update_one(
+                                {"thread_id": thread_id},
+                                {"$push": {"email_chain": email_chain_entry}}
+                            )
+                        else:
+                            # Store non-intent email in MongoDB without creating a ticket
+                            tickets_collection.insert_one({
+                                "ado_ticket_id": None,
+                                "sender": sender_email,
+                                "subject": email["subject"],
+                                "thread_id": thread_id,
+                                "email_id": email_id,
+                                "ticket_title": "Non-intent email",
+                                "ticket_description": email_intent_result["ticket_description"],
+                                "email_timestamp": datetime.now().isoformat(),
+                                "updates": [],
+                                "email_chain": [email_chain_entry],
+                                "pending_actions": False,
+                                "type_of_request": "non_intent",
+                                "details": {"attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]}
+                            })
+                        cleanup_temp_files(temp_files)
+                        continue
+
                     if intent == "request_summary":
                         if not existing_ticket:
                             logger.warning(f"No existing ticket found for thread_id={thread_id} for summary request")
@@ -165,14 +193,13 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                 "email_id": email_id,
                                 "message": "No existing ticket found for summary request"
                             })
-                            # Send a reply indicating no ticket found
                             email_response = (
                                 f"Hi,\n\nI couldn't find an existing request associated with this thread. "
                                 f"Please provide the ticket ID or more details, and I'll be happy to assist!\n\nBest,\nAgent\nIT Support"
                             )
                             reply_result = await kernel.invoke(
                                 kernel.plugins["email_sender"]["send_reply"],
-                                to=email.get("from", "Unknown"),
+                                to=sender_email,
                                 subject=email["subject"],
                                 body=email_response,
                                 thread_id=thread_id,
@@ -197,7 +224,7 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                     {
                                         "$set": {
                                             "ado_ticket_id": None,
-                                            "sender": email.get("from", "Unknown"),
+                                            "sender": sender_email,
                                             "subject": email["subject"],
                                             "thread_id": thread_id,
                                             "email_id": email_id,
@@ -220,13 +247,12 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                             cleanup_temp_files(temp_files)
                             continue
 
-                        # Handle summary request
                         summary_result = await agent.generate_summary_response(existing_ticket, email_content)
                         email_response = summary_result["email_response"]
 
                         reply_result = await kernel.invoke(
                             kernel.plugins["email_sender"]["send_reply"],
-                            to=email.get("from", "Unknown"),
+                            to=sender_email,
                             subject=email["subject"],
                             body=email_response,
                             thread_id=thread_id,
@@ -286,7 +312,7 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                         if not is_follow_up:
                             ticket_record = {
                                 "ado_ticket_id": ticket_id,
-                                "sender": email.get("from", "Unknown"),
+                                "sender": sender_email,
                                 "subject": email["subject"],
                                 "thread_id": thread_id,
                                 "email_id": email_id,
@@ -297,13 +323,8 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                 "email_chain": [email_chain_entry],
                                 "pending_actions": pending_actions,
                                 "type_of_request": "github" if intent.startswith("github_") else intent,
-                                "details": {}
+                                "details": {"attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]}
                             }
-                            
-                            ticket_record["details"]["attachments"] = [
-                                {"filename": a["filename"], "mimeType": a["mimeType"]} 
-                                for a in attachments
-                            ]
                             
                             if intent == "github_access_request":
                                 github_details = {
@@ -311,52 +332,25 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                     "repo_name": repo_name if repo_name and repo_name != "unspecified" else "",
                                     "username": github_username if github_username and github_username != "unspecified" else "",
                                     "access_type": access_type if access_type and access_type != "unspecified" else "read",
-                                    "status": "pending"
+                                    "status": "completed" if result.get("github", {}).get("success") else "failed",
+                                    "message": result.get("github", {}).get("message", "GitHub access request initiated")
                                 }
-                                
                                 ticket_record["details"]["github"] = [github_details]
-                                tickets_collection.insert_one(ticket_record)
-                                
-                                git_result = await kernel.invoke(
-                                    kernel.plugins["git"]["grant_repo_access"],
-                                    repo_name=github_details["repo_name"],
-                                    github_username=github_details["username"],
-                                    access_type="pull" if github_details["access_type"] == "read" else github_details["access_type"]
-                                )
-                                
-                                new_status = "completed" if git_result.value["success"] else "failed"
-                                tickets_collection.update_one(
-                                    {"ado_ticket_id": ticket_id, "details.github.username": github_details["username"]},
-                                    {
-                                        "$set": {
-                                            "details.github.$.status": new_status,
-                                            "details.github.$.message": git_result.value["message"]
-                                        }
-                                    }
-                                )
-                                
-                                logger.info(f"GitHub access request completed: {new_status}")
-                            
                             elif intent == "general_it_request":
-                                sender_username = email.get("from", "Unknown").split('@')[0] if '@' in email.get("from", "Unknown") else "User"
+                                sender_username = sender_email.split('@')[0] if '@' in sender_email else sender_email
                                 detailed_description = ticket_description
-                                
                                 if sender_username.lower() not in detailed_description.lower():
                                     detailed_description = f"User {sender_username}: {detailed_description}"
-                                
                                 general_details = {
                                     "request_type": "general_it_request",
                                     "status": "pending",
                                     "message": detailed_description,
                                     "requester": sender_username
                                 }
-                                
                                 ticket_record["details"]["general"] = [general_details]
                                 ticket_record["ticket_description"] = detailed_description
-                                
-                                tickets_collection.insert_one(ticket_record)
-                                logger.info(f"General IT request created")
                             
+                            tickets_collection.insert_one(ticket_record)
                             ado_url = f"https://dev.azure.com/{os.getenv('ADO_ORGANIZATION')}/{os.getenv('ADO_PROJECT')}/_workitems/edit/{ticket_id}"
                             await broadcast({
                                 "type": "ticket_created",
@@ -369,154 +363,42 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                             })
                         else:
                             if intent.startswith("github_"):
-                                comment = ""
-                                status = "pending"
-                                github_details = {}
+                                updated_ticket = tickets_collection.find_one({"ado_ticket_id": ticket_id})
+                                all_completed = await agent.are_all_actions_completed(updated_ticket)
+                                ado_status = "Done" if all_completed else "Doing"
                                 
-                                if intent == "github_access_request":
-                                    github_details = {
-                                        "request_type": intent,
-                                        "repo_name": repo_name if repo_name and repo_name != "unspecified" else "",
-                                        "username": github_username if github_username and github_username != "unspecified" else "",
-                                        "access_type": access_type if access_type and access_type != "unspecified" else "read",
-                                        "status": "pending"
-                                    }
-                                    comment = f"Processing GitHub access request for {github_username} to repo {repo_name}"
-                                    
-                                    update_operation = {
-                                        "$push": {
-                                            "updates": {
-                                                "status": status,
-                                                "comment": comment,
-                                                "revision_id": f"git-{intent.split('_')[1]}-{ticket_id}-{len(existing_ticket.get('updates', []))+1}",
-                                                "email_sent": False,
-                                                "email_message_id": None,
-                                                "email_timestamp": datetime.now().isoformat()
-                                            },
-                                            "email_chain": email_chain_entry
-                                        },
-                                        "$set": {
-                                            "pending_actions": True
+                                update_operation = {
+                                    "$push": {
+                                        "email_chain": email_chain_entry,
+                                        "updates": {
+                                            "status": ado_status,
+                                            "comment": f"Processed {intent} for {github_username} on {repo_name}",
+                                            "revision_id": f"git-{intent.split('_')[1]}-{ticket_id}-{len(updated_ticket.get('updates', [])) + 1}",
+                                            "email_sent": False,
+                                            "email_message_id": None,
+                                            "email_timestamp": datetime.now().isoformat()
                                         }
+                                    },
+                                    "$set": {
+                                        "pending_actions": pending_actions
                                     }
-                                    
-                                    if "github" not in existing_ticket.get("details", {}):
-                                        update_operation["$set"]["details.github"] = [github_details]
-                                    else:
-                                        update_operation["$push"]["details.github"] = github_details
-                                    
-                                    tickets_collection.update_one(
-                                        {"ado_ticket_id": ticket_id},
-                                        update_operation
-                                    )
-                                    
-                                    git_result = await kernel.invoke(
-                                        kernel.plugins["git"]["grant_repo_access"],
-                                        repo_name=github_details["repo_name"],
-                                        github_username=github_details["username"],
-                                        access_type="pull" if github_details["access_type"] == "read" else github_details["access_type"]
-                                    )
-                                    
-                                    new_status = "completed" if git_result.value["success"] else "failed"
-                                    new_comment = git_result.value["message"]
-                                    
-                                    tickets_collection.update_one(
-                                        {"ado_ticket_id": ticket_id, "details.github.username": github_details["username"]},
-                                        {
-                                            "$set": {
-                                                "details.github.$[elem].status": new_status,
-                                                "details.github.$[elem].message": new_comment,
-                                                "pending_actions": False
-                                            },
-                                            "$push": {
-                                                "updates": {
-                                                    "status": new_status,
-                                                    "comment": new_comment,
-                                                    "revision_id": f"git-result-{ticket_id}-{len(existing_ticket.get('updates', []))+2}",
-                                                    "email_sent": False,
-                                                    "email_message_id": None,
-                                                    "email_timestamp": datetime.now().isoformat()
-                                                }
-                                            }
-                                        },
-                                        array_filters=[{"elem.username": github_details["username"], "elem.request_type": intent}]
-                                    )
+                                }
+                                tickets_collection.update_one({"ado_ticket_id": ticket_id}, update_operation)
                                 
-                                elif intent == "github_revoke_access":
-                                    github_details = {
-                                        "request_type": intent,
-                                        "repo_name": repo_name if repo_name and repo_name != "unspecified" else "",
-                                        "username": github_username if github_username and github_username != "unspecified" else "",
-                                        "access_type": access_type if access_type and access_type != "unspecified" else "read",
-                                        "status": "pending"
-                                    }
-                                    comment = f"Processing access revocation for {github_username} from {repo_name}"
-                                    
-                                    update_operation = {
-                                        "$push": {
-                                            "updates": {
-                                                "status": status,
-                                                "comment": comment,
-                                                "revision_id": f"git-{intent.split('_')[1]}-{ticket_id}-{len(existing_ticket.get('updates', []))+1}",
-                                                "email_sent": False,
-                                                "email_message_id": None,
-                                                "email_timestamp": datetime.now().isoformat()
-                                            },
-                                            "email_chain": email_chain_entry
-                                        },
-                                        "$set": {
-                                            "pending_actions": True
-                                        }
-                                    }
-                                    
-                                    if "github" not in existing_ticket.get("details", {}):
-                                        update_operation["$set"]["details.github"] = [github_details]
-                                    else:
-                                        update_operation["$push"]["details.github"] = github_details
-                                    
-                                    tickets_collection.update_one(
-                                        {"ado_ticket_id": ticket_id},
-                                        update_operation
-                                    )
-                                    
-                                    git_result = await kernel.invoke(
-                                        kernel.plugins["git"]["revoke_repo_access"],
-                                        repo_name=github_details["repo_name"],
-                                        github_username=github_details["username"]
-                                    )
-                                    
-                                    new_status = "revoked" if git_result.value["success"] else "failed"
-                                    new_comment = git_result.value["message"]
-                                    
-                                    tickets_collection.update_one(
-                                        {"ado_ticket_id": ticket_id, "details.github.username": github_details["username"]},
-                                        {
-                                            "$set": {
-                                                "details.github.$[elem].status": new_status,
-                                                "details.github.$[elem].message": new_comment,
-                                                "pending_actions": False
-                                            },
-                                            "$push": {
-                                                "updates": {
-                                                    "status": new_status,
-                                                    "comment": new_comment,
-                                                    "revision_id": f"git-result-{ticket_id}-{len(existing_ticket.get('updates', []))+2}",
-                                                    "email_sent": False,
-                                                    "email_message_id": None,
-                                                    "email_timestamp": datetime.now().isoformat()
-                                                }
-                                            }
-                                        },
-                                        array_filters=[{"elem.username": github_details["username"], "elem.request_type": intent}]
-                                    )
+                                await kernel.invoke(
+                                    kernel.plugins["ado"]["update_ticket"],
+                                    ticket_id=ticket_id,
+                                    status=ado_status,
+                                    comment=f"Processed {intent} for {github_username} on {repo_name}"
+                                )
                                 
                                 await broadcast({
                                     "type": "ticket_updated",
                                     "email_id": email_id,
                                     "ticket_id": ticket_id,
-                                    "status": new_status,
+                                    "status": ado_status,
                                     "request_type": intent,
-                                    "comment": new_comment
+                                    "comment": f"Processed {intent} for {github_username} on {repo_name}"
                                 })
                             elif intent == "general_it_request":
                                 status = "updated"
@@ -527,7 +409,7 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                         "updates": {
                                             "status": status,
                                             "comment": comment,
-                                            "revision_id": f"general-update-{ticket_id}-{len(existing_ticket.get('updates', []))+1}",
+                                            "revision_id": f"general-update-{ticket_id}-{len(existing_ticket.get('updates', [])) + 1}",
                                             "email_sent": False,
                                             "email_message_id": None,
                                             "email_timestamp": datetime.now().isoformat()
@@ -550,10 +432,7 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                 else:
                                     update_operation["$push"]["details.general"] = general_details
                                 
-                                tickets_collection.update_one(
-                                    {"ado_ticket_id": ticket_id},
-                                    update_operation
-                                )
+                                tickets_collection.update_one({"ado_ticket_id": ticket_id}, update_operation)
                                 
                                 await broadcast({
                                     "type": "ticket_updated",
@@ -563,8 +442,6 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                     "request_type": intent,
                                     "comment": comment
                                 })
-                                
-                                logger.info(f"General IT request follow-up processed: {comment}")
                     else:
                         logger.error(f"Failed to process email ID={email_id}: {result['message']}")
                         await broadcast({

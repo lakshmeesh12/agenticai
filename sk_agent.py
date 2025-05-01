@@ -28,7 +28,7 @@ class SKAgent:
         logger.info("Initialized SKAgent with AzureOpenAI client")
 
     async def analyze_intent(self, subject: str, body: str, attachments: list = None) -> dict:
-        """Analyze email intent using Azure OpenAI, including attachment details."""
+        """Analyze email intent using Azure OpenAI, relying on contextual understanding."""
         try:
             # Clean HTML from body
             if "<html>" in body.lower():
@@ -44,49 +44,66 @@ class SKAgent:
                 content += attachment_info
 
             prompt = (
-                "You are an IT support assistant analyzing an email to determine the user's intent. "
-                "Classify the intent as one of: 'github_access_request', 'github_revoke_access', 'general_it_request', or 'request_summary'. "
-                "For 'request_summary', identify requests for a summary, status, or details about a previous request (e.g., 'Can you give a quick summary of this request?'). "
-                "For 'general_it_request', create a specific, detailed ticket description that summarizes the issue concisely but comprehensively. "
-                "If attachments (e.g., screenshots) are present, include their details in the description. "
-                "Extract the username or requester name from the email sender address (before the @ symbol) if available. "
+                "You are an IT support assistant analyzing an email to determine the user's intent based on its context and purpose, without relying on specific keywords. "
+                "Classify the intent as one of: 'github_access_request', 'github_revoke_access', 'general_it_request', 'request_summary', or 'non_intent'. "
+                "Understand the email's overall intent by evaluating whether it requests a specific, immediate IT action or is non-actionable (e.g., appreciation, acknowledgment, or vague future requests). "
+                "Extract relevant details only for actionable intents. For 'general_it_request', include attachment details in the description if present. "
+                "Extract the username or requester name from the sender address (before the @ symbol) if available. "
                 "Rules:\n"
+                "- Non-intent email:\n"
+                "  - Intent: 'non_intent'.\n"
+                "  - Applies to emails with no specific, immediate IT request, such as appreciation (e.g., 'thanks for your help'), acknowledgments, greetings, or vague requests for future updates (e.g., 'let me know if there are updates').\n"
+                "  - Characteristics: No clear demand for action, no specific IT issue, or no immediate task (e.g., 'Thanks for your mail and please let me know once you have any updates' is non-intent as it’s an acknowledgment with a future-oriented request).\n"
+                "  - Actions: [].\n"
+                "  - Pending actions: false.\n"
+                "  - Ticket description: 'Non-actionable email (e.g., appreciation or generic message)'.\n"
+                "  - No ADO ticket creation or update required.\n"
                 "- Request summary:\n"
                 "  - Intent: 'request_summary'.\n"
-                "  - Detect phrases like 'summary', 'status', 'update', 'details', 'what happened', 'progress' in subject or body.\n"
+                "  - Applies to emails explicitly requesting a current status, summary, or details of a previous request (e.g., 'Can you provide a summary of the poc access request?' or 'What’s the status of my ticket?').\n"
+                "  - Characteristics: Clear demand for information about an existing ticket or request.\n"
                 "  - Actions: [].\n"
                 "  - Pending actions: false.\n"
                 "  - Ticket description: 'User requested summary of previous request'.\n"
-                "  - No ADO ticket creation or update required.\n"
                 "- GitHub access request:\n"
                 "  - Intent: 'github_access_request'.\n"
+                "  - Applies to emails requesting access to a GitHub repository (e.g., 'Please grant read access to poc for testuser9731').\n"
                 "  - Extract: repo_name, access_type ('pull' for read, 'push' for write, 'unspecified' if unclear), github_username.\n"
                 "  - Action: {'action': 'grant_access', 'repo_name', 'access_type', 'github_username'}.\n"
-                "  - Pending actions: true if phrases like 'I will let you know', 'once work is completed', 'revoke later' are present; false otherwise.\n"
+                "  - Pending actions: true if the email implies future revocation (e.g., 'I will let you know when to revoke'); false otherwise.\n"
                 "  - Ticket description: e.g., 'Grant read access to poc for testuser9731'.\n"
                 "- GitHub access revocation:\n"
                 "  - Intent: 'github_revoke_access'.\n"
+                "  - Applies to emails requesting removal of GitHub access (e.g., 'Please revoke access to poc for testuser9731').\n"
                 "  - Extract: repo_name, github_username.\n"
                 "  - Action: {'action': 'revoke_access', 'repo_name', 'github_username'}.\n"
                 "  - Pending actions: false.\n"
                 "  - Ticket description: e.g., 'Revoke access to poc for testuser9731'.\n"
                 "- General IT request:\n"
                 "  - Intent: 'general_it_request'.\n"
+                "  - Applies to emails describing a specific IT issue or request not related to GitHub (e.g., 'I’m having VPN connection issues').\n"
                 "  - Actions: [].\n"
                 "  - Pending actions: false.\n"
-                "  - Ticket description: Create a specific, detailed ticket description, e.g., 'User johndoe reports VPN connection error.'.\n"
+                "  - Ticket description: Create a specific, detailed description, e.g., 'User johndoe reports VPN connection error.' Include attachment details if present.\n"
                 "- Unclear intent:\n"
                 "  - Intent: 'error'.\n"
+                "  - Applies when the email’s intent cannot be determined and is not clearly non-actionable.\n"
                 "  - Actions: [].\n"
                 "  - Pending actions: false.\n"
                 "  - Ticket description: 'Unable to determine intent'.\n"
                 "Return JSON: {'intent', 'ticket_description', 'actions', 'pending_actions', 'repo_name', 'access_type', 'github_username'}.\n"
                 f"Email:\n{content}\n\n"
                 "Examples:\n"
-                "1. Subject: Request access to poc repo\nBody: Grant read access to poc. Username: testuser9731.\n"
-                "   ```json\n{\"intent\": \"github_access_request\", \"ticket_description\": \"Grant read access to poc for testuser9731\", \"actions\": [{\"action\": \"grant_access\", \"repo_name\": \"poc\", \"access_type\": \"pull\", \"github_username\": \"testuser9731\"}], \"pending_actions\": false, \"repo_name\": \"poc\", \"access_type\": \"pull\", \"github_username\": \"testuser9731\"}\n```\n"
-                "2. Subject: Summary of poc access request\nBody: Can you give a quick summary of the poc access request?\n"
+                "1. Subject: Request access to poc repo\nBody: Please grant read access to poc for testuser9731. I will let you know when to revoke.\n"
+                "   ```json\n{\"intent\": \"github_access_request\", \"ticket_description\": \"Grant read access to poc for testuser9731\", \"actions\": [{\"action\": \"grant_access\", \"repo_name\": \"poc\", \"access_type\": \"pull\", \"github_username\": \"testuser9731\"}], \"pending_actions\": true, \"repo_name\": \"poc\", \"access_type\": \"pull\", \"github_username\": \"testuser9731\"}\n```\n"
+                "2. Subject: Status of my request\nBody: Can you provide a summary of the poc access request?\n"
                 "   ```json\n{\"intent\": \"request_summary\", \"ticket_description\": \"User requested summary of previous request\", \"actions\": [], \"pending_actions\": false, \"repo_name\": \"unspecified\", \"access_type\": \"unspecified\", \"github_username\": \"unspecified\"}\n```\n"
+                "3. Subject: Thanks for your mail\nBody: Thanks for your mail and please let me know once you have any updates.\n"
+                "   ```json\n{\"intent\": \"non_intent\", \"ticket_description\": \"Non-actionable email (e.g., appreciation or generic message)\", \"actions\": [], \"pending_actions\": false, \"repo_name\": \"unspecified\", \"access_type\": \"unspecified\", \"github_username\": \"unspecified\"}\n```\n"
+                "4. Subject: VPN issue\nBody: I’m having trouble connecting to the VPN. Can you help?\n"
+                "   ```json\n{\"intent\": \"general_it_request\", \"ticket_description\": \"User reports VPN connection error\", \"actions\": [], \"pending_actions\": false, \"repo_name\": \"unspecified\", \"access_type\": \"unspecified\", \"github_username\": \"unspecified\"}\n```\n"
+                "5. Subject: Great job\nBody: Thanks for the quick response on my last request. Appreciate it!\n"
+                "   ```json\n{\"intent\": \"non_intent\", \"ticket_description\": \"Non-actionable email (e.g., appreciation or generic message)\", \"actions\": [], \"pending_actions\": false, \"repo_name\": \"unspecified\", \"access_type\": \"unspecified\", \"github_username\": \"unspecified\"}\n```\n"
                 "Output format:\n"
                 "```json\n{\"intent\": \"<intent>\", \"ticket_description\": \"<description>\", \"actions\": [<action_objects>], \"pending_actions\": <bool>, \"repo_name\": \"<repo>\", \"access_type\": \"<pull|push|unspecified>\", \"github_username\": \"<username>\"}\n```"
             )
@@ -329,6 +346,13 @@ class SKAgent:
                     f"Please try again or contact support."
                 )
             }
+    async def are_all_actions_completed(self, ticket: dict) -> bool:
+        """Check if all GitHub actions in the ticket are completed and no pending actions remain."""
+        github_actions = ticket.get("details", {}).get("github", [])
+        pending_actions = ticket.get("pending_actions", False)
+        actions_completed = all(action["status"] in ["completed", "revoked", "failed"] for action in github_actions)
+        return actions_completed and not pending_actions
+
     async def process_email(self, email: dict, broadcast, existing_ticket: dict = None, email_content: str = None) -> dict:
         """Process an email through the workflow: analyze, create/update ticket, perform actions, send reply."""
         try:
@@ -353,7 +377,7 @@ class SKAgent:
             intent = intent_result["intent"]
             ticket_description = intent_result["ticket_description"]
             actions = intent_result["actions"]
-            pending_actions = intent_result["pending_actions"]
+            pending_actions = intent_result["pending_actions"] or (existing_ticket.get("pending_actions", False) if is_follow_up else False)
             repo_name = intent_result.get("repo_name", "unspecified")
             access_type = intent_result.get("access_type", "unspecified")
             github_username = intent_result.get("github_username", "unspecified")
@@ -364,6 +388,32 @@ class SKAgent:
                 "intent": intent,
                 "pending_actions": pending_actions
             })
+
+            # Handle non-intent emails
+            if intent == "non_intent":
+                logger.info(f"Non-intent email detected (ID={email_id}). Stopping workflow.")
+                # Update email_chain in existing ticket if follow-up
+                if is_follow_up:
+                    email_chain_entry = {
+                        "email_id": email_id,
+                        "from": sender,
+                        "subject": subject,
+                        "body": body,
+                        "timestamp": email.get("received", datetime.now().isoformat()),
+                        "attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]
+                    }
+                    self.tickets_collection.update_one(
+                        {"thread_id": thread_id},
+                        {"$push": {"email_chain": email_chain_entry}}
+                    )
+                return {
+                    "status": "success",
+                    "intent": "non_intent",
+                    "ticket_id": existing_ticket["ado_ticket_id"] if is_follow_up else None,
+                    "message": "Non-intent email processed; no further action taken",
+                    "actions": [],
+                    "pending_actions": False
+                }
 
             if intent == "request_summary" and is_follow_up:
                 # Handle summary request
@@ -399,31 +449,85 @@ class SKAgent:
                     "pending_actions": False
                 }
 
-            if intent == "github_revoke_access" and is_follow_up:
-                # Handle follow-up email to revoke access
-                ticket_id = existing_ticket["ado_ticket_id"]
-                github_result = await self.kernel.invoke(
-                    self.kernel.plugins["git"]["revoke_repo_access"],
-                    repo_name=repo_name,
-                    github_username=github_username
-                )
-                github_result = github_result.value if github_result else {"success": False, "message": "GitHub revoke action failed"}
-                status = "Done"
-                comment = github_result["message"]
+            ticket_id = existing_ticket["ado_ticket_id"] if is_follow_up else None
+            github_result = None
+            completed_actions = []
 
-                github_revoke_details = {
-                    "request_type": "github_revoke_access",
+            if is_follow_up and intent in ["github_access_request", "github_revoke_access"]:
+                ticket_id = existing_ticket["ado_ticket_id"]
+                github_details = {
+                    "request_type": intent,
                     "repo_name": repo_name,
                     "username": github_username,
-                    "status": "revoked",
-                    "message": comment
+                    "access_type": access_type if intent == "github_access_request" else "unspecified",
+                    "status": "pending",
+                    "message": f"Processing {intent} for {github_username} on {repo_name}"
                 }
 
-                await self.kernel.invoke(
-                    self.kernel.plugins["ado"]["update_ticket"],
-                    ticket_id=ticket_id,
-                    status=status,
-                    comment=comment
+                # Update ticket with new GitHub action
+                update_operation = {
+                    "$push": {
+                        "details.github": github_details,
+                        "updates": {
+                            "status": "Doing",
+                            "comment": github_details["message"],
+                            "revision_id": f"git-{intent.split('_')[1]}-{ticket_id}-{len(existing_ticket.get('updates', [])) + 1}",
+                            "email_sent": False,
+                            "email_message_id": None,
+                            "email_timestamp": datetime.now().isoformat()
+                        }
+                    },
+                    "$set": {
+                        "pending_actions": pending_actions
+                    }
+                }
+                self.tickets_collection.update_one({"ado_ticket_id": ticket_id}, update_operation)
+
+                # Perform GitHub action
+                if intent == "github_access_request":
+                    github_result = await self.kernel.invoke(
+                        self.kernel.plugins["git"]["grant_repo_access"],
+                        repo_name=repo_name,
+                        github_username=github_username,
+                        access_type=access_type
+                    )
+                    github_result = github_result.value if github_result else {"success": False, "message": "GitHub grant action failed"}
+                    github_details["status"] = "completed" if github_result["success"] else "failed"
+                    github_details["message"] = github_result["message"]
+                    completed_actions.append({"action": "grant_access", "completed": github_result["success"]})
+                else:  # github_revoke_access
+                    github_result = await self.kernel.invoke(
+                        self.kernel.plugins["git"]["revoke_repo_access"],
+                        repo_name=repo_name,
+                        github_username=github_username
+                    )
+                    github_result = github_result.value if github_result else {"success": False, "message": "GitHub revoke action failed"}
+                    github_details["status"] = "revoked" if github_result["success"] else "failed"
+                    github_details["message"] = github_result["message"]
+                    completed_actions.append({"action": "revoke_access", "completed": github_result["success"]})
+                    pending_actions = False  # Revocation completes the pending action
+
+                # Update ticket with GitHub action result
+                self.tickets_collection.update_one(
+                    {"ado_ticket_id": ticket_id, "details.github": {"$elemMatch": {"repo_name": repo_name, "username": github_username, "request_type": intent}}},
+                    {
+                        "$set": {
+                            "details.github.$[elem].status": github_details["status"],
+                            "details.github.$[elem].message": github_details["message"],
+                            "pending_actions": pending_actions
+                        },
+                        "$push": {
+                            "updates": {
+                                "status": github_details["status"],
+                                "comment": github_details["message"],
+                                "revision_id": f"git-result-{ticket_id}-{len(existing_ticket.get('updates', [])) + 2}",
+                                "email_sent": False,
+                                "email_message_id": None,
+                                "email_timestamp": datetime.now().isoformat()
+                            }
+                        }
+                    },
+                    array_filters=[{"elem.repo_name": repo_name, "elem.username": github_username, "elem.request_type": intent}]
                 )
 
                 await broadcast({
@@ -431,9 +535,23 @@ class SKAgent:
                     "email_id": email_id,
                     "ticket_id": ticket_id,
                     "success": github_result["success"],
-                    "message": github_result["message"]
+                    "message": github_details["message"]
                 })
 
+                # Check if all actions are completed
+                updated_ticket = self.tickets_collection.find_one({"ado_ticket_id": ticket_id})
+                all_completed = await self.are_all_actions_completed(updated_ticket)
+                ado_status = "Done" if all_completed else "Doing"
+
+                # Update ADO ticket
+                await self.kernel.invoke(
+                    self.kernel.plugins["ado"]["update_ticket"],
+                    ticket_id=ticket_id,
+                    status=ado_status,
+                    comment=github_details["message"]
+                )
+
+                # Send email reply
                 updates_result = await self.kernel.invoke(
                     self.kernel.plugins["ado"]["get_ticket_updates"],
                     ticket_id=ticket_id
@@ -465,11 +583,10 @@ class SKAgent:
                 return {
                     "status": "success",
                     "ticket_id": ticket_id,
-                    "github": github_result,
-                    "actions": [{"action": "revoke_access", "completed": github_result["success"]}],
-                    "pending_actions": False,
                     "intent": intent,
-                    "github_details": github_revoke_details
+                    "github": github_result,
+                    "actions": completed_actions,
+                    "pending_actions": pending_actions
                 }
 
             # Handle new email
@@ -496,8 +613,7 @@ class SKAgent:
                 "intent": intent
             })
 
-            github_result = None
-            completed_actions = []
+            github_details = None
             if intent == "github_access_request" and repo_name != "unspecified" and github_username != "unspecified":
                 github_result = await self.kernel.invoke(
                     self.kernel.plugins["git"]["grant_repo_access"],
@@ -506,15 +622,21 @@ class SKAgent:
                     access_type=access_type
                 )
                 github_result = github_result.value if github_result else {"success": False, "message": "GitHub action failed"}
-                status = "Done" if not pending_actions else "Doing"
-                comment = github_result["message"]
+                github_details = {
+                    "request_type": intent,
+                    "repo_name": repo_name,
+                    "username": github_username,
+                    "access_type": access_type,
+                    "status": "completed" if github_result["success"] else "failed",
+                    "message": github_result["message"]
+                }
                 completed_actions.append({"action": "grant_access", "completed": github_result["success"]})
 
                 await self.kernel.invoke(
                     self.kernel.plugins["ado"]["update_ticket"],
                     ticket_id=ticket_id,
-                    status=status,
-                    comment=comment
+                    status="Doing" if pending_actions else "Done",
+                    comment=github_result["message"]
                 )
 
                 await broadcast({
@@ -524,19 +646,36 @@ class SKAgent:
                     "success": github_result["success"],
                     "message": github_result["message"]
                 })
-            else:
-                status = "To Do"
-                comment = ticket_description
-                sender_username = sender.split('@')[0] if '@' in sender else sender
-                if sender_username.lower() not in ticket_description.lower():
-                    ticket_description = f"User {sender_username}: {ticket_description}"
-                await self.kernel.invoke(
-                    self.kernel.plugins["ado"]["update_ticket"],
-                    ticket_id=ticket_id,
-                    status=status,
-                    comment=comment
-                )
 
+            # Update ticket in MongoDB
+            ticket_record = {
+                "ado_ticket_id": ticket_id,
+                "sender": sender,
+                "subject": subject,
+                "thread_id": thread_id,
+                "email_id": email_id,
+                "ticket_title": subject,
+                "ticket_description": ticket_description,
+                "email_timestamp": datetime.now().isoformat(),
+                "updates": [],
+                "email_chain": [{
+                    "email_id": email_id,
+                    "from": sender,
+                    "subject": subject,
+                    "body": body,
+                    "timestamp": email.get("received", datetime.now().isoformat()),
+                    "attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]
+                }],
+                "pending_actions": pending_actions,
+                "type_of_request": "github" if intent.startswith("github_") else intent,
+                "details": {"attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]}
+            }
+            if github_details:
+                ticket_record["details"]["github"] = [github_details]
+
+            self.tickets_collection.insert_one(ticket_record)
+
+            # Send email reply
             updates_result = await self.kernel.invoke(
                 self.kernel.plugins["ado"]["get_ticket_updates"],
                 ticket_id=ticket_id
