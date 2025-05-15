@@ -17,6 +17,7 @@ from sk_agent import SKAgent
 from pydantic import BaseModel
 from fastapi import FastAPI, WebSocket, HTTPException
 from pydantic import BaseModel
+from aws import AWSPlugin
 
 
 # Configure logging
@@ -78,6 +79,7 @@ async def process_emails():
     kernel.add_plugin(EmailSenderPlugin(), plugin_name="email_sender")
     kernel.add_plugin(ADOPlugin(), plugin_name="ado")
     kernel.add_plugin(GitPlugin(), plugin_name="git")
+    kernel.add_plugin(AWSPlugin(), plugin_name="aws")
     agent = SKAgent(kernel, tickets_collection)
     logger.info(f"Registered plugins: {list(kernel.plugins.keys())}")
 

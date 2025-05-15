@@ -2,13 +2,14 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from google.auth.transport.requests import Request  # Added missing import
+from google.auth.transport.requests import Request
 from dotenv import load_dotenv
 import os
 import logging
 import base64
 from semantic_kernel.functions import kernel_function
 import tempfile
+import mimetypes
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -82,7 +83,7 @@ class EmailClient:
         """Recursively extract email body from payload."""
         body = ""
         mime_type = payload.get('mimeType', '')
-        
+
         if 'body' in payload and 'data' in payload['body']:
             body = self._decode_body(payload['body']['data'])
             if body:
@@ -104,36 +105,37 @@ class EmailClient:
                         body = nested_body
                         if part.get('mimeType') == 'text/plain':
                             return body
-        
+
         return body
 
     def _extract_attachments(self, msg, message_id):
-        """Extract image attachments (PNG, JPEG) and save to temporary files."""
+        """Extract all attachments and save to temporary files."""
         attachments = []
         if 'parts' in msg['payload']:
             for part in msg['payload']['parts']:
-                if part.get('filename') and part.get('mimeType', '').startswith('image/'):
-                    attachment_id = part['body'].get('attachmentId')
-                    if attachment_id:
-                        try:
-                            attachment = self.service.users().messages().attachments().get(
-                                userId='me', messageId=message_id, id=attachment_id
-                            ).execute()
-                            data = base64.urlsafe_b64decode(attachment['data'])
-                            filename = part['filename']
-                            mime_type = part['mimeType']
-                            # Save to temporary file
-                            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as temp_file:
-                                temp_file.write(data)
-                                temp_path = temp_file.name
-                            attachments.append({
-                                'filename': filename,
-                                'mimeType': mime_type,
-                                'path': temp_path
-                            })
-                            logger.info(f"Saved attachment {filename} to {temp_path}")
-                        except Exception as e:
-                            logger.error(f"Error fetching attachment {part.get('filename')}: {str(e)}")
+                if part.get('filename') and 'body' in part and part['body'].get('attachmentId'):
+                    attachment_id = part['body']['attachmentId']
+                    filename = part['filename']
+                    mime_type = part.get('mimeType', 'application/octet-stream')
+                    try:
+                        attachment = self.service.users().messages().attachments().get(
+                            userId='me', messageId=message_id, id=attachment_id
+                        ).execute()
+                        data = base64.urlsafe_b64decode(attachment['data'])
+                        # Determine file extension from MIME type or filename
+                        extension = mimetypes.guess_extension(mime_type) or os.path.splitext(filename)[1] or '.bin'
+                        # Save to temporary file
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=extension, prefix='email_attachment_') as temp_file:
+                            temp_file.write(data)
+                            temp_path = temp_file.name
+                        attachments.append({
+                            'filename': filename,
+                            'mimeType': mime_type,
+                            'path': temp_path
+                        })
+                        logger.info(f"Saved attachment {filename} (MIME: {mime_type}) to {temp_path}")
+                    except Exception as e:
+                        logger.error(f"Error fetching attachment {filename}: {str(e)}")
         return attachments
 
     def fetch_new_emails(self, limit=10):

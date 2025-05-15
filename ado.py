@@ -132,7 +132,6 @@ class ADOClient:
             }
             logger.info(f"Created ADO work item: ID={ticket['id']}, Title={title}")
 
-            # Attach email if provided
             if email_content:
                 attachment_url = self._upload_attachment(email_content, f"email_{work_item.id}.eml", is_eml=True)
                 if attachment_url:
