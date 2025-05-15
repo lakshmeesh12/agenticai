@@ -1,24 +1,18 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
-import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 import './App.css';
 
 const App = () => {
   const [agentStatus, setAgentStatus] = useState('stopped');
   const [sessionId, setSessionId] = useState(null);
-  const [timelineEvents, setTimelineEvents] = useState([]);
   const [tickets, setTickets] = useState([]);
-  const [logs, setLogs] = useState([]);
   const [adminRequest, setAdminRequest] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [modals, setModals] = useState([]);
   const [wsError, setWsError] = useState(null);
-  const [githubMetrics, setGithubMetrics] = useState({
-    byRequestType: [],
-    summary: { access: 0, revoke: 0, success: 0, pending: 0, failed: 0 }
-  });
+  const [expandedTickets, setExpandedTickets] = useState({});
 
-  // WebSocket connection with reconnection
+  // WebSocket connection
   useEffect(() => {
     let ws;
     let reconnectAttempts = 0;
@@ -34,20 +28,18 @@ const App = () => {
       ws.onmessage = (event) => {
         const message = JSON.parse(event.data);
         console.log('WebSocket message:', message);
-        if (message.type === 'session') {
-          setAgentStatus(message.status);
-          setSessionId(message.session_id);
-          const eventText = `Agent ${message.status} ${message.session_id ? `with session ID=${message.session_id}` : ''}`;
-          setTimelineEvents((prev) => {
-            if (!prev.some((e) => e.event === eventText)) {
-              return [...prev, { time: new Date().toLocaleTimeString(), event: eventText }];
-            }
+
+        setModals((prev) => {
+          const existingModalIndex = prev.findIndex(m => m.email_id === message.email_id);
+          let updatedModals = [...prev];
+
+          if (message.type === 'session') {
+            setAgentStatus(message.status);
+            setSessionId(message.session_id);
             return prev;
-          });
-        } else if (message.type === 'email_detected') {
-          const isValidDomain = message.is_valid_domain !== false;
-          setModals((prev) => {
-            if (!prev.some((m) => m.email_id === message.email_id)) {
+          } else if (message.type === 'email_detected') {
+            const isValidDomain = message.is_valid_domain !== false;
+            if (existingModalIndex === -1) {
               return [
                 ...prev,
                 {
@@ -61,216 +53,155 @@ const App = () => {
                 }
               ];
             }
-            return prev;
-          });
-          const eventText = `New email: ${message.subject}${!isValidDomain ? ' - UNAUTHORIZED DOMAIN' : ''}`;
-          setTimelineEvents((prev) => {
-            if (!prev.some((e) => e.event === eventText)) {
-              return [...prev, { time: new Date().toLocaleTimeString(), event: eventText }];
-            }
-            return prev;
-          });
-        } else if (message.type === 'spam_alert') {
-          setModals((prev) => {
-            const existingModalIndex = prev.findIndex(m => m.email_id === message.email_id);
+          } else if (message.type === 'spam_alert') {
             if (existingModalIndex !== -1) {
-              const updatedModals = [...prev];
               updatedModals[existingModalIndex] = {
                 ...updatedModals[existingModalIndex],
                 steps: [
                   ...updatedModals[existingModalIndex].steps,
                   {
                     status: 'SECURITY ALERT',
-                    details: `<span style="color: #cc0000; font-weight: bold;">⚠️ ${message.message}</span>`
+                    details: `<span class="text-red">⚠️ ${message.message}</span>`
                   }
                 ],
                 isSpam: true
               };
               return updatedModals;
-            } else {
-              return [
-                ...prev,
-                {
-                  email_id: message.email_id,
+            }
+          } else if (message.type === 'intent_analyzed') {
+            if (existingModalIndex !== -1) {
+              const hasIntent = updatedModals[existingModalIndex].steps.some(
+                step => step.status === 'Analyzing intent' && step.details === `Intent: ${message.intent}`
+              );
+              if (!hasIntent) {
+                updatedModals[existingModalIndex] = {
+                  ...updatedModals[existingModalIndex],
                   steps: [
+                    ...updatedModals[existingModalIndex].steps,
+                    { status: 'Analyzing intent', details: `Intent: ${message.intent}` }
+                  ]
+                };
+              }
+              return updatedModals;
+            }
+          } else if (message.type === 'ticket_created') {
+            if (existingModalIndex !== -1) {
+              const hasTicket = updatedModals[existingModalIndex].steps.some(
+                step => step.status === 'Created ADO ticket' && step.details.includes(`ID: ${message.ticket_id}`)
+              );
+              if (!hasTicket) {
+                updatedModals[existingModalIndex] = {
+                  ...updatedModals[existingModalIndex],
+                  steps: [
+                    ...updatedModals[existingModalIndex].steps,
                     {
-                      status: 'New email arrived',
-                      details: `Subject: ${message.subject}, From: ${message.sender} - UNAUTHORIZED DOMAIN`
-                    },
-                    {
-                      status: 'SECURITY ALERT',
-                      details: `<span style="color: #cc0000; font-weight: bold;">⚠️ ${message.message}</span>`
+                      status: 'Created ADO ticket',
+                      details: `ID: ${message.ticket_id}, <a href="${message.ado_url}" target="_blank" class="text-blue">View Ticket</a>`
                     }
-                  ],
-                  show: true,
-                  isSpam: true
-                }
-              ];
+                  ]
+                };
+              }
+              return updatedModals;
             }
-          });
-          const eventText = `SECURITY ALERT: ${message.message}`;
-          setTimelineEvents((prev) => {
-            if (!prev.some((e) => e.event === eventText)) {
-              return [...prev, { time: new Date().toLocaleTimeString(), event: eventText }];
+          } else if (message.type === 'action_performed') {
+            const actionLabels = {
+              github_create_repo: 'Created GitHub repository',
+              github_commit_file: 'Committed file to repository',
+              github_delete_repo: 'Deleted GitHub repository',
+              github_access_request: 'Granted repository access',
+              github_revoke_access: 'Revoked repository access',
+              aws_s3_create_bucket: 'Created S3 bucket',
+              aws_s3_delete_bucket: 'Deleted S3 bucket',
+              aws_ec2_launch_instance: 'Launched EC2 instance',
+              aws_ec2_terminate_instance: 'Terminated EC2 instance',
+              aws_iam_add_user: 'Added IAM user',
+              aws_iam_remove_user: 'Removed IAM user',
+              aws_iam_add_user_permission: 'Added IAM user permission',
+              aws_iam_remove_user_permission: 'Removed IAM user permission'
+            };
+            const actionStatus = actionLabels[message.intent] || 'Performed action';
+            const actionDetails = message.success ? `Completed: ${message.message}` : `Failed: ${message.message}`;
+            
+            if (existingModalIndex !== -1) {
+              const hasAction = updatedModals[existingModalIndex].steps.some(
+                step => step.status === actionStatus && step.details === actionDetails
+              );
+              if (!hasAction) {
+                updatedModals[existingModalIndex] = {
+                  ...updatedModals[existingModalIndex],
+                  steps: [
+                    ...updatedModals[existingModalIndex].steps,
+                    { status: actionStatus, details: actionDetails }
+                  ]
+                };
+              }
+              return updatedModals;
             }
-            return prev;
-          });
-        } else if (message.type === 'intent_analyzed') {
-          setModals((prev) =>
-            prev.map((modal) =>
-              modal.email_id === message.email_id
-                ? {
-                    ...modal,
-                    steps: modal.steps.some((s) => s.status === 'Analyzing intent')
-                      ? modal.steps
-                      : [...modal.steps, { status: 'Analyzing intent', details: `Intent: ${message.intent}` }]
+          } else if (message.type === 'ticket_updated') {
+            if (existingModalIndex !== -1) {
+              updatedModals[existingModalIndex] = {
+                ...updatedModals[existingModalIndex],
+                steps: [
+                  ...updatedModals[existingModalIndex].steps,
+                  {
+                    status: 'Updated work item',
+                    details: `Status: ${message.status}, Comment: ${message.comment}`
                   }
-                : modal
-            )
-          );
-          const eventText = `Analyzed intent: ${message.intent}`;
-          setTimelineEvents((prev) => {
-            if (!prev.some((e) => e.event === eventText)) {
-              return [...prev, { time: new Date().toLocaleTimeString(), event: eventText }];
+                ]
+              };
             }
-            return prev;
-          });
-        } else if (message.type === 'ticket_created') {
-          setModals((prev) =>
-            prev.map((modal) =>
-              modal.email_id === message.email_id
-                ? {
-                    ...modal,
-                    steps: modal.steps.some((s) => s.status === 'Created ADO ticket')
-                      ? modal.steps
-                      : [
-                          ...modal.steps,
-                          {
-                            status: 'Created ADO ticket',
-                            details: `ID: ${message.ticket_id}, <a href="${message.ado_url}" target="_blank">View Ticket</a>`
-                          }
-                        ]
-                  }
-                : modal
-            )
-          );
-          const eventText = `Created ADO ticket ID=${message.ticket_id} (${message.intent})`;
-          setTimelineEvents((prev) => {
-            if (!prev.some((e) => e.event === eventText)) {
-              return [...prev, { time: new Date().toLocaleTimeString(), event: eventText }];
+            setTickets((prevTickets) =>
+              prevTickets.map((ticket) =>
+                ticket.ado_ticket_id === message.ticket_id?.toString()
+                  ? {
+                      ...ticket,
+                      updates: [
+                        ...ticket.updates,
+                        {
+                          status: message.status,
+                          comment: message.comment || 'No comment provided',
+                          revision_id: message.revision_id || `update-${Date.now()}`,
+                          email_sent: false,
+                          email_message_id: null,
+                          email_timestamp: new Date().toISOString()
+                        }
+                      ]
+                    }
+                  : ticket
+              )
+            );
+            return updatedModals;
+          } else if (message.type === 'email_reply') {
+            if (existingModalIndex !== -1) {
+              updatedModals[existingModalIndex] = {
+                ...updatedModals[existingModalIndex],
+                steps: [
+                  ...updatedModals[existingModalIndex].steps,
+                  { status: 'Sent reply to user', details: `Thread ID: ${message.thread_id}` }
+                ]
+              };
             }
-            return prev;
-          });
-        } else if (message.type === 'github_action') {
-          setModals((prev) =>
-            prev.map((modal) =>
-              modal.email_id === message.email_id
-                ? {
-                    ...modal,
-                    steps: modal.steps.some((s) => s.status === 'GitHub action')
-                      ? modal.steps
-                      : [
-                          ...modal.steps,
-                          {
-                            status: 'GitHub action',
-                            details: message.success ? `Completed: ${message.message}` : `Failed: ${message.message}`
-                          }
-                        ]
-                  }
-                : modal
-            )
-          );
-          const eventText = `GitHub action for ticket ID=${message.ticket_id}: ${message.success ? 'Completed' : 'Failed'}`;
-          setTimelineEvents((prev) => {
-            if (!prev.some((e) => e.event === eventText)) {
-              return [...prev, { time: new Date().toLocaleTimeString(), event: eventText }];
-            }
-            return prev;
-          });
-        } else if (message.type === 'ticket_updated') {
-          setModals((prev) =>
-            prev.map((modal) =>
-              modal.email_id === message.email_id
-                ? {
-                    ...modal,
-                    steps: modal.steps.some((s) => s.status === 'Updated work item')
-                      ? modal.steps
-                      : [
-                          ...modal.steps,
-                          {
-                            status: 'Updated work item',
-                            details: `Status: ${message.status}, Comment: ${message.comment}`
-                          }
-                        ]
-                  }
-                : modal
-            )
-          );
-          const eventText = `Updated ticket ID=${message.ticket_id} to ${message.status}`;
-          setTimelineEvents((prev) => {
-            if (!prev.some((e) => e.event === eventText)) {
-              return [...prev, { time: new Date().toLocaleTimeString(), event: eventText }];
-            }
-            return prev;
-          });
-          setTickets((prev) =>
-            prev.map((ticket) =>
-              ticket.ado_ticket_id === message.ticket_id?.toString()
-                ? {
-                    ...ticket,
-                    updates: [
-                      ...ticket.updates,
-                      {
-                        status: message.status,
-                        comment: message.comment || 'No comment provided',
-                        revision_id: message.revision_id || `update-${Date.now()}`,
-                        email_sent: false,
-                        email_message_id: null,
-                        email_timestamp: new Date().toISOString()
-                      }
-                    ]
-                  }
-                : ticket
-            )
-          );
-        } else if (message.type === 'email_reply') {
-          setModals((prev) =>
-            prev.map((modal) =>
-              modal.email_id === message.email_id
-                ? {
-                    ...modal,
-                    steps: modal.steps.some((s) => s.status === 'Sent reply to user')
-                      ? modal.steps
-                      : [...modal.steps, { status: 'Sent reply to user', details: `Thread ID: ${message.thread_id}` }]
-                  }
-                : modal
-            )
-          );
-          const eventText = `Sent email reply (thread_id=${message.thread_id})`;
-          setTimelineEvents((prev) => {
-            if (!prev.some((e) => e.event === eventText)) {
-              return [...prev, { time: new Date().toLocaleTimeString(), event: eventText }];
-            }
-            return prev;
-          });
-          setTickets((prev) =>
-            prev.map((ticket) =>
-              ticket.email_id === message.email_id
-                ? {
-                    ...ticket,
-                    updates: ticket.updates.map((update, index) =>
-                      index === ticket.updates.length - 1
-                        ? { ...update, email_sent: true, email_message_id: message.message_id || `reply-${Date.now()}` }
-                        : update
-                    )
-                  }
-                : ticket
-            )
-          );
-        }
+            setTickets((prevTickets) =>
+              prevTickets.map((ticket) =>
+                ticket.email_id === message.email_id
+                  ? {
+                      ...ticket,
+                      updates: ticket.updates.map((update, index) =>
+                        index === ticket.updates.length - 1
+                          ? { ...update, email_sent: true, email_message_id: message.message_id || `reply-${Date.now()}` }
+                          : update
+                      )
+                    }
+                  : ticket
+              )
+            );
+            return updatedModals;
+          }
+          return prev;
+        });
       };
       ws.onerror = (error) => {
-        console.error('WebSocket error:', error);
+        console.log('WebSocket error:', error);
         setWsError('WebSocket connection failed');
       };
       ws.onclose = () => {
@@ -288,189 +219,65 @@ const App = () => {
     return () => ws && ws.close();
   }, []);
 
-  // Fallback polling for session status
-  useEffect(() => {
-    const fetchStatus = async () => {
-      try {
-        const res = await axios.get('http://localhost:8000/status');
-        const newStatus = res.data.is_running ? 'started' : 'stopped';
-        if (newStatus !== agentStatus || res.data.session_id !== sessionId) {
-          setAgentStatus(newStatus);
-          setSessionId(res.data.session_id);
-          const eventText = `Agent ${newStatus} ${res.data.session_id ? `with session ID=${res.data.session_id}` : ''}`;
-          setTimelineEvents((prev) => {
-            if (!prev.some((e) => e.event === eventText)) {
-              return [...prev, { time: new Date().toLocaleTimeString(), event: eventText }];
-            }
-            return prev;
-          });
-        }
-      } catch (error) {
-        console.error('Error fetching status:', error);
-        setWsError('');
-      }
-    };
-    fetchStatus();
-    const interval = setInterval(fetchStatus, 5000);
-    return () => clearInterval(interval);
-  }, [agentStatus, sessionId]);
-
-  // Process GitHub data for visualization
-  useEffect(() => {
-    const processGitHubData = () => {
-      const githubTickets = tickets.filter(ticket => ticket.type_of_request === 'github' && ticket.details && ticket.details.github);
-      const typeMap = new Map();
-      let accessCount = 0;
-      let revokeCount = 0;
-      let successCount = 0;
-      let pendingCount = 0;
-      let failedCount = 0;
-
-      githubTickets.forEach(ticket => {
-        if (!ticket.details || !ticket.details.github) return;
-        ticket.details.github.forEach(request => {
-          const requestType = request.request_type === 'github_access_request' ? 'Access' : 'Revoke';
-          if (!typeMap.has(requestType)) {
-            typeMap.set(requestType, { name: requestType, count: 0 });
-          }
-          typeMap.get(requestType).count += 1;
-          if (request.request_type === 'github_access_request') {
-            accessCount++;
-          } else if (request.request_type === 'github_revoke_access') {
-            revokeCount++;
-          }
-          if (request.status === 'pending') {
-            pendingCount++;
-          } else if (request.status === 'completed' || request.status === 'revoked') {
-            successCount++;
-          } else {
-            failedCount++;
-          }
-        });
-      });
-
-      setGithubMetrics({
-        byRequestType: Array.from(typeMap.values()),
-        summary: {
-          access: accessCount,
-          revoke: revokeCount,
-          success: successCount,
-          pending: pendingCount,
-          failed: failedCount
-        }
-      });
-    };
-
-    if (tickets && tickets.length > 0) {
-      processGitHubData();
-    }
-  }, [tickets]);
-
-  // Fetch tickets and logs
+  // Fetch tickets
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const [ticketsRes, logsRes] = await Promise.all([
-          axios.get('http://localhost:8000/tickets'),
-          axios.get('http://localhost:8000/logs')
-        ]);
+        const ticketsRes = await axios.get('http://localhost:8000/tickets');
         console.log('Fetched tickets:', ticketsRes.data.tickets);
         setTickets(ticketsRes.data.tickets || []);
-        setLogs(logsRes.data.logs || []);
-
-        (ticketsRes.data.tickets || []).forEach((ticket) => {
-          const ticketEvent = `Created ADO ticket ID=${ticket.ado_ticket_id}`;
-          if (!timelineEvents.some((e) => e.event === ticketEvent)) {
-            setTimelineEvents((prev) => [
-              ...prev,
-              { time: new Date().toLocaleTimeString(), event: ticketEvent }
-            ]);
-          }
-          (ticket.updates || []).forEach((update) => {
-            if (update.email_sent) {
-              const replyEvent = `Sent email reply (thread_id=${ticket.thread_id})`;
-              if (!timelineEvents.some((e) => e.event === replyEvent)) {
-                setTimelineEvents((prev) => [
-                  ...prev,
-                  { time: new Date().toLocaleTimeString(), event: replyEvent }
-                ]);
-              }
-            }
-          });
-        });
       } catch (error) {
-        console.error('Error fetching data:', error);
-        const errorEvent = `Error fetching data: ${error.message}`;
-        setTimelineEvents((prev) => {
-          if (!prev.some((e) => e.event === errorEvent)) {
-            return [...prev, { time: new Date().toLocaleTimeString(), event: errorEvent }];
-          }
-          return prev;
-        });
+        console.error('Error fetching tickets:', error);
       }
     };
     fetchData();
     const interval = setInterval(fetchData, 5000);
     return () => clearInterval(interval);
-  }, [timelineEvents]);
+  }, []);
 
-  // Start or stop the agent
+  // Handle agent toggle
   const handleAgentToggle = async () => {
+    const newStatus = agentStatus === 'stopped' ? 'started' : 'stopped';
+    const endpoint = agentStatus === 'stopped' ? '/run-agent' : '/stop-agent';
     try {
-      const endpoint = agentStatus === 'stopped' ? '/run-agent' : '/stop-agent';
+      console.log(`Calling endpoint: ${endpoint}`);
+      setAgentStatus(newStatus); // Set state immediately for UI feedback
       const res = await axios.get(`http://localhost:8000${endpoint}`);
-      const eventText = res.data.message;
-      setTimelineEvents((prev) => {
-        if (!prev.some((e) => e.event === eventText)) {
-          return [...prev, { time: new Date().toLocaleTimeString(), event: eventText }];
-        }
-        return prev;
-      });
+      console.log('API response:', res.data);
+      // Log success but don't revert state
+      console.log(`Agent ${newStatus === 'started' ? 'started' : 'stopped'} successfully`);
     } catch (error) {
-      console.error('Error toggling agent:', error);
-      const errorEvent = `Error toggling agent: ${error.message}`;
-      setTimelineEvents((prev) => {
-        if (!prev.some((e) => e.event === errorEvent)) {
-          return [...prev, { time: new Date().toLocaleTimeString(), event: errorEvent }];
-        }
-        return prev;
-      });
+      console.error(`Error ${newStatus === 'started' ? 'starting' : 'stopping'} agent:`, error);
+      setWsError(`Failed to ${newStatus === 'started' ? 'start' : 'stop'} agent`);
+      // Don't revert state on error to avoid flicker; handle manually if needed
     }
   };
-
   // Handle sending admin request
   const handleSendRequest = async () => {
     if (!adminRequest.trim()) {
       alert('Please enter a request.');
       return;
     }
-
-    // Extract ticket ID from request (basic regex to find a number)
     const ticketIdMatch = adminRequest.match(/\b(\d+)\b/);
     const ticketId = ticketIdMatch ? parseInt(ticketIdMatch[0]) : null;
-
     if (!ticketId) {
       setModals((prev) => [
         ...prev,
         {
           email_id: `admin-request-${Date.now()}`,
-          steps: [
-            { status: 'Error', details: 'No valid ticket ID found in the request. Please include a ticket ID.' }
-          ],
+          steps: [{ status: 'Error', details: 'No valid ticket ID found in the request.' }],
           show: true,
           isSpam: false
         }
       ]);
       return;
     }
-
     setIsSending(true);
     try {
       const res = await axios.post('http://localhost:8000/send-request', {
         ticket_id: ticketId,
         request: adminRequest
       });
-
       setModals((prev) => [
         ...prev,
         {
@@ -506,266 +313,239 @@ const App = () => {
     }
   };
 
-  // Close a specific modal
+  // Close modal
   const closeModal = (email_id) => {
     setModals((prev) => prev.filter((modal) => modal.email_id !== email_id));
   };
 
-  // Filter tickets (no longer filtered by search, but kept for potential future use)
-  const filteredTickets = tickets;
-
-  // Colors for charts
-  const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884d8'];
-
-  // Custom formatter for the Legend labels
-  const renderColorfulLegendText = (value, entry) => {
-    const { color } = entry;
-    return <span style={{ color }}>{value}</span>;
+  // Toggle ticket details
+  const toggleTicketDetails = (ticketId) => {
+    setExpandedTickets((prev) => ({
+      ...prev,
+      [ticketId]: !prev[ticketId]
+    }));
   };
 
   return (
     <div className="app">
-      {/* Header */}
-      <header className="header">
-        <h1>IT Support Agent</h1>
-        <nav>
-          <button className="nav-link">Dashboard</button>
-          <button className="nav-link">Logs</button>
-        </nav>
+      {/* Navbar */}
+      <header className="navbar">
+        <div className="navbar-container">
+          <h1 className="navbar-title">IT Support Dashboard</h1>
+          <nav>
+            <button className="nav-button">Profile</button>
+          </nav>
+        </div>
       </header>
 
-      {/* Modals for Workflow Notifications */}
-      {modals.length > 0 && (
-        <div className="modal-container">
-          {modals.map((modal) => (
-            <div
-              key={modal.email_id}
-              className={`modal ${modal.isSpam ? 'spam-modal' : ''}`}
-            >
-              <div className="modal-content">
-                <h3>
-                  {modal.isSpam
-                    ? '⚠️ Unauthorized Email Alert ⚠️'
-                    : modal.steps.some(step => step.status === 'Admin Request')
-                      ? 'Admin Request Response'
-                      : 'Email Processing Workflow'}
-                  (ID: {modal.email_id})
-                </h3>
-                <ul>
-                  {modal.steps.map((step, stepIndex) => (
-                    <li key={stepIndex} className={`modal-step ${step.status === 'SECURITY ALERT' ? 'alert-step' : ''}`}>
-                      <strong>{step.status}:</strong> <span dangerouslySetInnerHTML={{ __html: step.details }} />
-                    </li>
-                  ))}
-                </ul>
+      {/* Main Content */}
+      <main className="main-container">
+        <h2 className="dashboard-title">Admin Space</h2>
+        
+        {/* Send Request */}
+        <section className="send-request">
+          <div className="request-card">
+            <div className="request-wrapper">
+              <textarea
+                className="request-input"
+                placeholder="Enter your request (e.g., Summarize ticket ID 208)"
+                value={adminRequest}
+                onChange={(e) => setAdminRequest(e.target.value)}
+                rows="3"
+              />
+              <div className="request-actions">
+                <button className="voice-button" title="Voice Input (Coming Soon)">
+                  <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <rect x="9" y="2" width="6" height="12" rx="3" ry="3"></rect>
+                    <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                    <line x1="12" y1="19" x2="12" y2="22"></line>
+                    <line x1="9" y1="22" x2="15" y2="22"></line>
+                  </svg>
+                </button>
                 <button
-                  onClick={() => closeModal(modal.email_id)}
-                  className="modal-close"
+                  className={`send-button ${isSending ? 'button-disabled' : ''}`}
+                  onClick={handleSendRequest}
+                  disabled={isSending}
                 >
-                  Close
+                  <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <line x1="22" y1="2" x2="11" y2="13"></line>
+                    <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                  </svg>
                 </button>
               </div>
             </div>
-          ))}
-        </div>
-      )}
-
-      {/* Main Content */}
-      <div className="container">
-        <div className="sidebar">
-          {/* Process Timeline */}
-          <div className="timeline">
-            <h2>Process Timeline</h2>
-            {wsError && <div className="log-error">{wsError}</div>}
-            <div className="timeline-content">
-              {timelineEvents.map((event, index) => (
-                <div key={index} className="timeline-event">
-                  <span className="timeline-time">{event.time}</span>
-                  <span className="timeline-text">{event.event}</span>
-                </div>
-              ))}
-            </div>
           </div>
+        </section>
 
-          {/* Logs Panel */}
-          <div className="logs">
-            <h2>Logs</h2>
-            <div className="logs-content">
-              {logs.map((log, index) => (
-                <div key={index} className={log.includes('ERROR') ? 'log-error' : 'log-normal'}>
-                  {log}
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        {/* Dashboard */}
-        <div className="dashboard">
-          <h2>Dashboard</h2>
-          <div className="admin-request">
-            <textarea
-              placeholder="Enter your request (e.g., Can you give a quick summary for ticket ID 145?)"
-              value={adminRequest}
-              onChange={(e) => setAdminRequest(e.target.value)}
-              className="admin-request-input"
-              rows="4"
-            />
-            <button
-              onClick={handleSendRequest}
-              className="send-request-button"
-              disabled={isSending}
-            >
-              {isSending ? 'Sending...' : 'Send Request'}
-            </button>
-          </div>
-
-          {/* GitHub Metrics Dashboard */}
-          <div className="github-dashboard">
-            <h3>GitHub Access Management Analytics</h3>
-            <div className="github-charts">
-              {/* Request Type Distribution */}
-              <div className="chart-container">
-                <h4>Request Distribution</h4>
-                <ResponsiveContainer width="100%" height={200}>
-                  <PieChart>
-                    <Pie
-                      data={githubMetrics.byRequestType}
-                      cx="50%"
-                      cy="50%"
-                      labelLine={false}
-                      outerRadius={70}
-                      fill="#8884d8"
-                      dataKey="count"
-                      nameKey="name"
-                    >
-                      {githubMetrics.byRequestType.map((entry, index) => (
-                        <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
-                      ))}
-                    </Pie>
-                    <Tooltip />
-                    <Legend
-                      formatter={renderColorfulLegendText}
-                      layout="horizontal"
-                      verticalAlign="bottom"
-                      align="center"
-                    />
-                  </PieChart>
-                </ResponsiveContainer>
-                <div className="chart-legend">
-                  <div className="legend-item">
-                    <div className="legend-color" style={{ backgroundColor: '#0088FE' }}></div>
-                    <span>Access: {githubMetrics.summary.access}</span>
-                  </div>
-                  <div className="legend-item">
-                    <div className="legend-color" style={{ backgroundColor: '#00C49F' }}></div>
-                    <span>Revoke: {githubMetrics.summary.revoke}</span>
-                  </div>
-                </div>
+        {/* Tickets Table */}
+        <section className="ticket-section">
+          <div className="card">
+            <h3 className="card-title">Tickets</h3>
+            {tickets.length === 0 ? (
+              <p className="no-data">No tickets available.</p>
+            ) : (
+              <div className="ticket-table-wrapper">
+                <table className="ticket-table">
+                  <thead>
+                    <tr>
+                      <th>ID</th>
+                      <th>Title</th>
+                      <th>Sender</th>
+                      <th>Status</th>
+                      <th>Pending Actions</th>
+                      <th>Details</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {tickets.map((ticket) => (
+                      <React.Fragment key={ticket.ado_ticket_id}>
+                        <tr className="ticket-row">
+                          <td>{ticket.ado_ticket_id}</td>
+                          <td>{ticket.ticket_title}</td>
+                          <td>{ticket.sender}</td>
+                          <td>{ticket.updates?.length > 0 ? ticket.updates[ticket.updates.length - 1].status : 'New'}</td>
+                          <td>{ticket.pending_actions ? 'Yes' : 'No'}</td>
+                          <td>
+                            <button
+                              className="details-button"
+                              onClick={() => toggleTicketDetails(ticket.ado_ticket_id)}
+                            >
+                              {expandedTickets[ticket.ado_ticket_id] ? 'Hide' : 'Show'}
+                            </button>
+                          </td>
+                        </tr>
+                        {expandedTickets[ticket.ado_ticket_id] && (
+                          <tr className="details-row">
+                            <td colSpan="6">
+                              <div className="ticket-details">
+                                <h4 className="section-title">Description</h4>
+                                <p className="ticket-info">{ticket.ticket_description}</p>
+                                <h4 className="section-title">Details</h4>
+                                <p className="ticket-info">Type: {ticket.type_of_request}</p>
+                                {ticket.details?.github && (
+                                  <div>
+                                    <h5 className="sub-section-title">GitHub Actions</h5>
+                                    <ul className="action-list">
+                                      {ticket.details.github.map((action, index) => (
+                                        <li key={index}>
+                                          {action.action.replace('github_', '').replace('_', ' ').toUpperCase()}: {action.completed ? 'Completed' : 'Pending'}
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                )}
+                                {ticket.details?.aws && (
+                                  <div>
+                                    <h5 className="sub-section-title">AWS Actions</h5>
+                                    <ul className="action-list">
+                                      {ticket.details.aws.map((action, index) => (
+                                        <li key={index}>
+                                          {action.action.replace('aws_', '').replace('_', ' ').toUpperCase()}: {action.completed ? 'Completed' : 'Pending'}
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                )}
+                                {ticket.details?.attachments && (
+                                  <div>
+                                    <h5 className="sub-section-title">Attachments</h5>
+                                    <ul className="action-list">
+                                      {ticket.details.attachments.map((attachment, index) => (
+                                        <li key={index}>{attachment.filename} ({attachment.mimeType})</li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                )}
+                                <h4 className="section-title">Updates</h4>
+                                <div className="update-list">
+                                  {ticket.updates.map((update, index) => (
+                                    <div key={index} className="update-item">
+                                      <p>Status: {update.status}</p>
+                                      <p>Comment: {update.comment}</p>
+                                      <p>Timestamp: {new Date(update.email_timestamp).toLocaleString()}</p>
+                                      <p>Email Sent: {update.email_sent ? 'Yes' : 'No'}</p>
+                                    </div>
+                                  ))}
+                                </div>
+                                <h4 className="section-title">Email Chain</h4>
+                                <div className="email-list">
+                                  {ticket.email_chain.map((email, index) => (
+                                    <div key={index} className="email-item">
+                                      <p><strong>From:</strong> {email.from}</p>
+                                      <p><strong>Subject:</strong> {email.subject}</p>
+                                      <p><strong>Timestamp:</strong> {new Date(parseInt(email.timestamp)).toLocaleString()}</p>
+                                      <p><strong>Body:</strong></p>
+                                      <p className="email-body">{email.body}</p>
+                                      {email.attachments?.length > 0 && (
+                                        <div>
+                                          <p><strong>Attachments:</strong></p>
+                                          <ul className="action-list">
+                                            {email.attachments.map((attachment, idx) => (
+                                              <li key={idx}>{attachment.filename} ({attachment.mimeType})</li>
+                                            ))}
+                                          </ul>
+                                        </div>
+                                      )}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    ))}
+                  </tbody>
+                </table>
               </div>
-
-              {/* Status Distribution */}
-              <div className="chart-container">
-                <h4>Request Status</h4>
-                <ResponsiveContainer width="100%" height={200}>
-                  <PieChart>
-                    <Pie
-                      data={[
-                        { name: 'Success', value: githubMetrics.summary.success },
-                        { name: 'Pending', value: githubMetrics.summary.pending },
-                        { name: 'Failed', value: githubMetrics.summary.failed }
-                      ]}
-                      cx="50%"
-                      cy="50%"
-                      labelLine={false}
-                      outerRadius={70}
-                      fill="#8884d8"
-                      dataKey="value"
-                      nameKey="name"
-                    >
-                      <Cell fill="#00C49F" />
-                      <Cell fill="#FFBB28" />
-                      <Cell fill="#FF8042" />
-                    </Pie>
-                    <Tooltip />
-                    <Legend
-                      formatter={renderColorfulLegendText}
-                      layout="horizontal"
-                      verticalAlign="bottom"
-                      align="center"
-                    />
-                  </PieChart>
-                </ResponsiveContainer>
-                <div className="chart-legend">
-                  <div className="legend-item">
-                    <div className="legend-color" style={{ backgroundColor: '#00C49F' }}></div>
-                    <span>Success: {githubMetrics.summary.success}</span>
-                  </div>
-                  <div className="legend-item">
-                    <div className="legend-color" style={{ backgroundColor: '#FFBB28' }}></div>
-                    <span>Pending: {githubMetrics.summary.pending}</span>
-                  </div>
-                  <div className="legend-item">
-                    <div className="legend-color" style={{ backgroundColor: '#FF8042' }}></div>
-                    <span>Failed: {githubMetrics.summary.failed}</span>
-                  </div>
-                </div>
-              </div>
-            </div>
+            )}
           </div>
+        </section>
+      </main>
 
-          {/* Ticket Table */}
-          <div className="ticket-table">
-            <h3>Tickets</h3>
-            <table>
-              <thead>
-                <tr>
-                  <th>ID</th>
-                  <th>Title</th>
-                  <th>Status</th>
-                  <th>Created</th>
-                  <th>Updated</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredTickets.map((ticket) => (
-                  <tr key={ticket.ado_ticket_id}>
-                    <td>{ticket.ado_ticket_id}</td>
-                    <td>{ticket.subject || 'Untitled'}</td>
-                    <td>{(ticket.updates && ticket.updates.length > 0) ? ticket.updates[ticket.updates.length - 1].status : 'New'}</td>
-                    <td>{ticket.email_timestamp ? new Date(ticket.email_timestamp).toLocaleDateString() : 'N/A'}</td>
-                    <td>{(ticket.updates && ticket.updates.length > 0) ? ticket.updates[ticket.updates.length - 1].email_timestamp.split('T')[0] : 'N/A'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+      {/* Agent Control (Floating) */}
+      <button
+        className={`agent-button ${agentStatus === 'stopped' ? 'start-button' : 'stop-button'}`}
+        onClick={handleAgentToggle}
+      >
+        {agentStatus === 'stopped' ? 'Start Agent' : 'Stop Agent'}
+      </button>
 
-          {/* Email Responses */}
-          <div className="email-responses">
-            <h3>Email Responses</h3>
-            <ul>
-              {filteredTickets
-                .filter((ticket) => ticket.updates && ticket.updates.some((u) => u.email_sent))
-                .map((ticket) => (
-                  <li key={ticket.email_id}>
-                    Thread ID: {ticket.thread_id}, Sent: {(ticket.updates.find((u) => u.email_sent) || {}).email_timestamp?.split('T')[1]?.split('.')[0] || 'N/A'}
-                  </li>
-                ))}
-            </ul>
-          </div>
-        </div>
-      </div>
-
-      {/* Agent Controls */}
-      <div className="controls">
-        <button
-          onClick={handleAgentToggle}
-          className={agentStatus === 'stopped' ? 'start-button' : 'stop-button'}
+      {/* Workflow Modals */}
+      {modals.map((modal) => (
+        <div
+          key={modal.email_id}
+          className={`modal ${modal.show ? 'modal-visible' : ''} ${modal.isSpam ? 'modal-spam' : ''}`}
         >
-          {agentStatus === 'stopped' ? 'Start Agent' : 'Stop Agent'}
-        </button>
-      </div>
+          <div className="modal-content">
+            <button
+              className="modal-close"
+              onClick={() => closeModal(modal.email_id)}
+              title="Close"
+            >
+              ×
+            </button>
+            <h3 className="modal-title">
+              {modal.isSpam
+                ? '⚠️ Unauthorized Email Alert'
+                : modal.steps.some(step => step.status === 'Admin Request')
+                  ? 'Admin Request Response'
+                  : 'Email Processing Workflow'} (ID: {modal.email_id})
+            </h3>
+            <div className="modal-steps">
+              {modal.steps.map((step, index) => (
+                <div
+                  key={`${step.status}-${index}`}
+                  className={`step-item ${step.status === 'SECURITY ALERT' ? 'step-alert' : ''}`}
+                >
+                  <p className="step-status">{step.status}</p>
+                  <p className="step-details" dangerouslySetInnerHTML={{ __html: step.details }} />
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      ))}
     </div>
   );
 };
