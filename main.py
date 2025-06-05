@@ -18,7 +18,10 @@ from pydantic import BaseModel
 from fastapi import FastAPI, WebSocket, HTTPException
 from pydantic import BaseModel
 from aws import AWSPlugin
-
+from monitor import MonitorPlugin 
+from task_manager import TaskManager
+from servicenow import ServiceNowPlugin
+from typing import Optional
 
 # Configure logging
 logging.basicConfig(
@@ -72,16 +75,20 @@ def cleanup_temp_files(temp_files):
         except Exception as e:
             logger.error(f"Error deleting temporary file {file_path}: {str(e)}")
 
+# main.py
+
 async def process_emails():
-    """Poll for new emails and process them."""
     kernel = Kernel()
     kernel.add_plugin(EmailReaderPlugin(), plugin_name="email_reader")
     kernel.add_plugin(EmailSenderPlugin(), plugin_name="email_sender")
     kernel.add_plugin(ADOPlugin(), plugin_name="ado")
+    kernel.add_plugin(ServiceNowPlugin(), plugin_name="servicenow")
     kernel.add_plugin(GitPlugin(), plugin_name="git")
     kernel.add_plugin(AWSPlugin(), plugin_name="aws")
+    kernel.add_plugin(MonitorPlugin(), plugin_name="monitor")
     agent = SKAgent(kernel, tickets_collection)
     logger.info(f"Registered plugins: {list(kernel.plugins.keys())}")
+    logger.debug(f"Monitor plugin functions: {list(kernel.plugins['monitor'].functions.keys())}")
 
     valid_domain = "@quadranttechnologies.com"
     
@@ -159,7 +166,6 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                         ]
                     }
 
-                    # Handle non-intent emails
                     if intent == "non_intent":
                         logger.info(f"Non-intent email detected (ID={email_id}). Adding to email_chain and stopping processing.")
                         if existing_ticket:
@@ -168,9 +174,9 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                 {"$push": {"email_chain": email_chain_entry}}
                             )
                         else:
-                            # Store non-intent email in MongoDB without creating a ticket
                             tickets_collection.insert_one({
                                 "ado_ticket_id": None,
+                                "servicenow_sys_id": None,
                                 "sender": sender_email,
                                 "subject": email["subject"],
                                 "thread_id": thread_id,
@@ -226,6 +232,7 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                     {
                                         "$set": {
                                             "ado_ticket_id": None,
+                                            "servicenow_sys_id": None,
                                             "sender": sender_email,
                                             "subject": email["subject"],
                                             "thread_id": thread_id,
@@ -287,7 +294,8 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                             await broadcast({
                                 "type": "email_reply",
                                 "email_id": email_id,
-                                "ticket_id": existing_ticket["ado_ticket_id"],
+                                "ado_ticket_id": existing_ticket["ado_ticket_id"],
+                                "servicenow_sys_id": existing_ticket["servicenow_sys_id"],
                                 "thread_id": thread_id,
                                 "timestamp": datetime.now().isoformat()
                             })
@@ -300,7 +308,8 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                     cleanup_temp_files(temp_files)
                     
                     if result["status"] == "success":
-                        ticket_id = result["ticket_id"]
+                        ado_ticket_id = result["ado_ticket_id"]
+                        servicenow_sys_id = result["servicenow_sys_id"]
                         intent = result.get("intent", "general_it_request")
                         pending_actions = result.get("pending_actions", False)
                         is_follow_up = bool(existing_ticket)
@@ -313,7 +322,8 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
 
                         if not is_follow_up:
                             ticket_record = {
-                                "ado_ticket_id": ticket_id,
+                                "ado_ticket_id": ado_ticket_id,
+                                "servicenow_sys_id": servicenow_sys_id,
                                 "sender": sender_email,
                                 "subject": email["subject"],
                                 "thread_id": thread_id,
@@ -325,7 +335,8 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                 "email_chain": [email_chain_entry],
                                 "pending_actions": pending_actions,
                                 "type_of_request": "github" if intent.startswith("github_") else intent,
-                                "details": {"attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]}
+                                "details": {"attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]},
+                                "last_fields": {}  # Initialize for ServiceNow field tracking
                             }
                             
                             if intent == "github_access_request":
@@ -353,29 +364,33 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                 ticket_record["ticket_description"] = detailed_description
                             
                             tickets_collection.insert_one(ticket_record)
-                            ado_url = f"https://dev.azure.com/{os.getenv('ADO_ORGANIZATION')}/{os.getenv('ADO_PROJECT')}/_workitems/edit/{ticket_id}"
+                            ado_url = f"https://dev.azure.com/{os.getenv('ADO_ORGANIZATION')}/{os.getenv('ADO_PROJECT')}/_workitems/edit/{ado_ticket_id}"
+                            servicenow_url = f"{os.getenv('SERVICENOW_INSTANCE_URL')}/nav_to.do?uri=incident.do?sys_id={servicenow_sys_id}" if servicenow_sys_id else None
                             await broadcast({
                                 "type": "ticket_created",
                                 "email_id": email_id,
-                                "ticket_id": ticket_id,
+                                "ado_ticket_id": ado_ticket_id,
+                                "servicenow_sys_id": servicenow_sys_id,
                                 "subject": email["subject"],
                                 "intent": intent,
                                 "request_type": intent,
-                                "ado_url": ado_url
+                                "ado_url": ado_url,
+                                "servicenow_url": servicenow_url
                             })
                         else:
                             if intent.startswith("github_"):
-                                updated_ticket = tickets_collection.find_one({"ado_ticket_id": ticket_id})
+                                updated_ticket = tickets_collection.find_one({"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id})
                                 all_completed = await agent.are_all_actions_completed(updated_ticket)
                                 ado_status = "Done" if all_completed else "Doing"
+                                servicenow_state = "Resolved" if all_completed else "In Progress"
                                 
                                 update_operation = {
                                     "$push": {
                                         "email_chain": email_chain_entry,
                                         "updates": {
-                                            "status": ado_status,
                                             "comment": f"Processed {intent} for {github_username} on {repo_name}",
-                                            "revision_id": f"git-{intent.split('_')[1]}-{ticket_id}-{len(updated_ticket.get('updates', [])) + 1}",
+                                            "status": ado_status,
+                                            "revision_id": f"git-{intent.split('_')[1]}-{ado_ticket_id}-{len(updated_ticket.get('updates', [])) + 1}",
                                             "email_sent": False,
                                             "email_message_id": None,
                                             "email_timestamp": datetime.now().isoformat()
@@ -385,19 +400,27 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                         "pending_actions": pending_actions
                                     }
                                 }
-                                tickets_collection.update_one({"ado_ticket_id": ticket_id}, update_operation)
+                                tickets_collection.update_one({"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id}, update_operation)
                                 
                                 await kernel.invoke(
                                     kernel.plugins["ado"]["update_ticket"],
-                                    ticket_id=ticket_id,
+                                    ticket_id=ado_ticket_id,
                                     status=ado_status,
                                     comment=f"Processed {intent} for {github_username} on {repo_name}"
                                 )
+                                if servicenow_sys_id:
+                                    await kernel.invoke(
+                                        kernel.plugins["servicenow"]["update_ticket"],
+                                        ticket_id=servicenow_sys_id,
+                                        state=servicenow_state,
+                                        comment=f"Processed {intent} for {github_username} on {repo_name}"
+                                    )
                                 
                                 await broadcast({
                                     "type": "ticket_updated",
                                     "email_id": email_id,
-                                    "ticket_id": ticket_id,
+                                    "ado_ticket_id": ado_ticket_id,
+                                    "servicenow_sys_id": servicenow_sys_id,
                                     "status": ado_status,
                                     "request_type": intent,
                                     "comment": f"Processed {intent} for {github_username} on {repo_name}"
@@ -409,9 +432,9 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                 update_operation = {
                                     "$push": {
                                         "updates": {
-                                            "status": status,
                                             "comment": comment,
-                                            "revision_id": f"general-update-{ticket_id}-{len(existing_ticket.get('updates', [])) + 1}",
+                                            "status": status,
+                                            "revision_id": f"general-update-{ado_ticket_id}-{len(existing_ticket.get('updates', [])) + 1}",
                                             "email_sent": False,
                                             "email_message_id": None,
                                             "email_timestamp": datetime.now().isoformat()
@@ -434,12 +457,13 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                 else:
                                     update_operation["$push"]["details.general"] = general_details
                                 
-                                tickets_collection.update_one({"ado_ticket_id": ticket_id}, update_operation)
+                                tickets_collection.update_one({"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id}, update_operation)
                                 
                                 await broadcast({
                                     "type": "ticket_updated",
                                     "email_id": email_id,
-                                    "ticket_id": ticket_id,
+                                    "ado_ticket_id": ado_ticket_id,
+                                    "servicenow_sys_id": servicenow_sys_id,
                                     "status": status,
                                     "request_type": intent,
                                     "comment": comment
@@ -452,45 +476,73 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                             "message": f"Failed to process email: {result['message']}"
                         })
 
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)
         except Exception as e:
             logger.error(f"Error in email processing loop: {str(e)}")
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)
 
 async def process_tickets():
-    """Check for ADO ticket updates."""
     kernel = Kernel()
     kernel.add_plugin(ADOPlugin(), plugin_name="ado")
+    kernel.add_plugin(ServiceNowPlugin(), plugin_name="servicenow")
     kernel.add_plugin(EmailSenderPlugin(), plugin_name="email_sender")
-    agent = SKAgent(kernel, tickets_collection)  # Pass tickets_collection
+    agent = SKAgent(kernel, tickets_collection)
 
     while is_running:
         try:
-            logger.info(f"Checking for ADO ticket updates in session {session_id}...")
+            logger.info(f"Checking for ADO and ServiceNow ticket updates in session {session_id}...")
             tickets = tickets_collection.find()
             
             for ticket in tickets:
-                ticket_id = ticket["ado_ticket_id"]
-                if not ticket_id:  # Skip tickets with no ado_ticket_id (e.g., summary requests without tickets)
+                ado_ticket_id = ticket.get("ado_ticket_id")
+                servicenow_sys_id = ticket.get("servicenow_sys_id")
+                if not ado_ticket_id and not servicenow_sys_id:
                     continue
-                update_result = await kernel.invoke(
-                    kernel.plugins["ado"]["get_ticket_updates"],
-                    ticket_id=ticket_id
-                )
-                updates = update_result.value if update_result else []
-                ticket_data = ticket_info.get(ticket_id, {"last_revision_id": 0})
-                last_revision_id = ticket_data["last_revision_id"]
                 
-                new_updates = [u for u in updates if u['revision_id'] > last_revision_id]
+                ado_new_updates = []
+                servicenow_new_updates = []
                 
-                if new_updates:
-                    logger.info(f"Found {len(new_updates)} new updates for ticket ID={ticket_id}")
+                # Check ADO updates
+                if ado_ticket_id:
+                    ado_update_result = await kernel.invoke(
+                        kernel.plugins["ado"]["get_ticket_updates"],
+                        ticket_id=ado_ticket_id
+                    )
+                    ado_updates = ado_update_result.value if ado_update_result else []
+                    ado_ticket_data = ticket_info.get(ado_ticket_id, {"last_revision_id": 0})
+                    ado_last_revision_id = ado_ticket_data["last_revision_id"]
+                    ado_new_updates = [u for u in ado_updates if u['revision_id'] > ado_last_revision_id]
+                
+                # Check ServiceNow updates
+                if servicenow_sys_id:
+                    servicenow_update_result = await kernel.invoke(
+                        kernel.plugins["servicenow"]["get_ticket_updates"],
+                        ticket_id=servicenow_sys_id
+                    )
+                    servicenow_updates = servicenow_update_result.value if servicenow_update_result else []
+                    servicenow_ticket_data = ticket_info.get(servicenow_sys_id, {"last_updated_on": ""})
+                    servicenow_last_updated_on = servicenow_ticket_data["last_updated_on"]
+                    servicenow_new_updates = [
+                        u for u in servicenow_updates 
+                        if u["sys_updated_on"] > servicenow_last_updated_on
+                    ]
+                    logger.debug(f"ServiceNow updates for sys_id={servicenow_sys_id}: {servicenow_new_updates}")  # Added debug log
+                
+                if ado_new_updates or servicenow_new_updates:
+                    logger.info(f"Found {len(ado_new_updates)} ADO updates and {len(servicenow_new_updates)} ServiceNow updates for ticket ADO={ado_ticket_id}/SN={servicenow_sys_id}")
                     attachments = ticket.get("details", {}).get("attachments", [])
-                    update_result = await agent.analyze_ticket_update(ticket_id, new_updates, attachments)
+                    
+                    # Analyze updates
+                    update_result = await agent.analyze_ticket_update(
+                        ado_ticket_id or servicenow_sys_id,
+                        ado_updates=ado_new_updates,
+                        servicenow_updates=servicenow_new_updates,
+                        attachments=attachments
+                    )
                     
                     if update_result["update_intent"] != "error":
                         sender = ticket.get('sender', 'Unknown')
-                        subject = ticket.get('subject', f"Update for Ticket {ticket_id}")
+                        subject = ticket.get('subject', f"Update for Ticket ADO={ado_ticket_id}/SN={servicenow_sys_id}")
                         thread_id = ticket.get('thread_id', str(uuid.uuid4()))
                         email_id = str(uuid.uuid4())
                         
@@ -522,13 +574,33 @@ async def process_tickets():
                         existing_email_ids = [e["email_id"] for e in ticket.get("email_chain", [])]
                         update_operations = []
                         
-                        for update in new_updates:
+                        # Store ADO updates
+                        for update in ado_new_updates:
                             update_operation = {
                                 "$push": {
                                     "updates": {
+                                        "source": "ado",
                                         "comment": update["comment"] or "No comment provided",
                                         "status": update["status"],
                                         "revision_id": update["revision_id"],
+                                        "email_sent": email_status,
+                                        "email_message_id": email_message_id,
+                                        "email_timestamp": datetime.now().isoformat()
+                                    }
+                                }
+                            }
+                            update_operations.append(update_operation)
+                        
+                        # Store ServiceNow updates
+                        for update in servicenow_new_updates:
+                            update_operation = {
+                                "$push": {
+                                    "updates": {
+                                        "source": "servicenow",
+                                        "field": update["field"],
+                                        "old_value": update["old_value"],
+                                        "new_value": update["new_value"],
+                                        "sys_updated_on": update["sys_updated_on"],
                                         "email_sent": email_status,
                                         "email_message_id": email_message_id,
                                         "email_timestamp": datetime.now().isoformat()
@@ -547,53 +619,82 @@ async def process_tickets():
                         
                         for operation in update_operations:
                             tickets_collection.update_one(
-                                {"ado_ticket_id": ticket_id},
+                                {"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id},
                                 operation,
                                 upsert=True
                             )
                         
                         if email_status:
-                            ticket_info[ticket_id] = {
+                            ticket_info[ado_ticket_id or servicenow_sys_id] = {
                                 "sender": sender,
                                 "subject": subject,
                                 "thread_id": thread_id,
                                 "email_id": email_id,
-                                "last_revision_id": max(u['revision_id'] for u in updates)
+                                "last_revision_id": max((u['revision_id'] for u in ado_new_updates), default=0) if ado_new_updates else ticket_info.get(ado_ticket_id, {}).get("last_revision_id", 0),
+                                "last_updated_on": max((u["sys_updated_on"] for u in servicenow_new_updates), default="") if servicenow_new_updates else ticket_info.get(servicenow_sys_id, {}).get("last_updated_on", "")
                             }
                             await broadcast({
                                 "type": "email_reply",
                                 "email_id": email_id,
-                                "ticket_id": ticket_id,
+                                "ado_ticket_id": ado_ticket_id,
+                                "servicenow_sys_id": servicenow_sys_id,
                                 "thread_id": thread_id,
                                 "timestamp": datetime.now().isoformat()
                             })
                     else:
-                        for update in new_updates:
-                            tickets_collection.update_one(
-                                {"ado_ticket_id": ticket_id},
-                                {
-                                    "$push": {
-                                        "updates": {
-                                            "comment": update["comment"] or "No comment provided",
-                                            "status": update["status"],
-                                            "revision_id": update["revision_id"],
-                                            "email_sent": False,
-                                            "email_message_id": None,
-                                            "email_timestamp": datetime.now().isoformat()
-                                        }
+                        update_operations = []
+                        for update in ado_new_updates:
+                            update_operation = {
+                                "$push": {
+                                    "updates": {
+                                        "source": "ado",
+                                        "comment": update["comment"] or "No comment provided",
+                                        "status": update["status"],
+                                        "revision_id": update["revision_id"],
+                                        "email_sent": False,
+                                        "email_message_id": None,
+                                        "email_timestamp": datetime.now().isoformat()
                                     }
-                                },
+                                }
+                            }
+                            update_operations.append(update_operation)
+                        
+                        for update in servicenow_new_updates:
+                            update_operation = {
+                                "$push": {
+                                    "updates": {
+                                        "source": "servicenow",
+                                        "field": update["field"],
+                                        "old_value": update["old_value"],
+                                        "new_value": update["new_value"],
+                                        "sys_updated_on": update["sys_updated_on"],
+                                        "email_sent": False,
+                                        "email_message_id": None,
+                                        "email_timestamp": datetime.now().isoformat()
+                                    }
+                                }
+                            }
+                            update_operations.append(update_operation)
+                        
+                        for operation in update_operations:
+                            tickets_collection.update_one(
+                                {"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id},
+                                operation,
                                 upsert=True
                             )
-                        ticket_info[ticket_id]["last_revision_id"] = max(u['revision_id'] for u in updates)
+                        
+                        if ado_ticket_id:
+                            ticket_info[ado_ticket_id]["last_revision_id"] = max((u['revision_id'] for u in ado_new_updates), default=0) if ado_new_updates else ticket_info.get(ado_ticket_id, {}).get("last_revision_id", 0)
+                        if servicenow_sys_id:
+                            ticket_info[servicenow_sys_id]["last_updated_on"] = max((u["sys_updated_on"] for u in servicenow_new_updates), default="") if servicenow_new_updates else ticket_info.get(servicenow_sys_id, {}).get("last_updated_on", "")
             
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)
         except Exception as e:
             logger.error(f"Error in ticket processing loop: {str(e)}")
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)
+
 @app.get("/run-agent")
 async def run_agent():
-    """Start the email and ticket tracking agent."""
     global is_running, email_task, ticket_task, session_id, ticket_info
     if is_running:
         logger.info("Agent is already running.")
@@ -604,36 +705,104 @@ async def run_agent():
     ticket_info = {}
     kernel = Kernel()
     kernel.add_plugin(ADOPlugin(), plugin_name="ado")
+    kernel.add_plugin(ServiceNowPlugin(), plugin_name="servicenow")
+    
+    # Fetch ADO tickets
     work_items_result = await kernel.invoke(
         kernel.plugins["ado"]["get_all_work_items"]
     )
     work_items = work_items_result.value if work_items_result else []
     for work_item in work_items:
-        ticket_id = work_item['id']
+        ado_ticket_id = work_item['id']
         updates_result = await kernel.invoke(
             kernel.plugins["ado"]["get_ticket_updates"],
-            ticket_id=ticket_id
+            ticket_id=ado_ticket_id
         )
         updates = updates_result.value if updates_result else []
         last_revision_id = max((u['revision_id'] for u in updates), default=0)
-        ticket_record = tickets_collection.find_one({"ado_ticket_id": ticket_id})
-        ticket_info[ticket_id] = {
+        ticket_record = tickets_collection.find_one({"ado_ticket_id": ado_ticket_id})
+        ticket_info[ado_ticket_id] = {
             "sender": ticket_record.get('sender', 'Unknown') if ticket_record else 'Unknown',
-            "subject": ticket_record.get('subject', f"Update for Ticket {ticket_id}") if ticket_record else f"Update for Ticket {ticket_id}",
+            "subject": ticket_record.get("subject", f"Update for Ticket {ado_ticket_id}") if ticket_record else f"Update for Ticket {ado_ticket_id}",
             "thread_id": ticket_record.get('thread_id', str(uuid.uuid4())) if ticket_record else str(uuid.uuid4()),
             "email_id": ticket_record.get('email_id', str(uuid.uuid4())) if ticket_record else str(uuid.uuid4()),
-            "last_revision_id": last_revision_id
+            "last_revision_id": last_revision_id,
+            "last_updated_on": ""
         }
+    
+    # Fetch ServiceNow incidents
+    incidents_result = await kernel.invoke(
+        kernel.plugins["servicenow"]["get_all_incidents"]
+    )
+    incidents = incidents_result.value if incidents_result else []
+    for incident in incidents:
+        servicenow_sys_id = incident['sys_id']
+        updates_result = await kernel.invoke(
+            kernel.plugins["servicenow"]["get_ticket_updates"],
+            ticket_id=servicenow_sys_id
+        )
+        updates = updates_result.value if updates_result else []
+        last_updated_on = max((u['sys_updated_on'] for u in updates), default="")
+        ticket_record = tickets_collection.find_one({"servicenow_sys_id": servicenow_sys_id})
+        ticket_info[servicenow_sys_id] = ticket_info.get(servicenow_sys_id, {
+            "sender": ticket_record.get('sender', 'Unknown') if ticket_record else 'Unknown',
+            "subject": ticket_record.get("subject", f"Update for Ticket {servicenow_sys_id}") if ticket_record else f"Update for Ticket {servicenow_sys_id}",
+            "thread_id": ticket_record.get('thread_id', str(uuid.uuid4())) if ticket_record else str(uuid.uuid4()),
+            "email_id": ticket_record.get('email_id', str(uuid.uuid4())) if ticket_record else str(uuid.uuid4()),
+            "last_revision_id": 0,
+            "last_updated_on": last_updated_on
+        })
+        ticket_info[servicenow_sys_id]["last_updated_on"] = last_updated_on
+
     is_running = True
     email_task = asyncio.create_task(process_emails())
     ticket_task = asyncio.create_task(process_tickets())
     
     await broadcast({"type": "session", "session_id": session_id, "status": "started"})
-    return {"status": "success", "message": f"Agent started with session ID={session_id}"}
+    return {"status": "success", "message": f"Agent started with session ID: {session_id}"}
 
 class AdminRequest(BaseModel):
     ticket_id: int
     request: str
+
+# @app.post("/send-request")
+# async def send_request(admin_request: AdminRequest):
+#     """Handle admin request for ticket summary or update."""
+#     try:
+#         kernel = Kernel()
+#         kernel.add_plugin(EmailReaderPlugin(), plugin_name="email_reader")
+#         kernel.add_plugin(EmailSenderPlugin(), plugin_name="email_sender")
+#         kernel.add_plugin(ADOPlugin(), plugin_name="ado")
+#         kernel.add_plugin(GitPlugin(), plugin_name="git")
+#         agent = SKAgent(kernel, tickets_collection)  # Pass tickets_collection
+
+#         result = await agent.process_admin_request(admin_request.ticket_id, admin_request.request)
+#         return {
+#             "status": "success",
+#             "summary_intent": result["summary_intent"],
+#             "response": result["email_response"]
+#         }
+#     except Exception as e:
+#         logger.error(f"Error in /send-request endpoint: {str(e)}")
+#         raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
+
+
+class AdminRequest(BaseModel):
+    # Change ticket_id to Optional[str] to match frontend and allow missing field
+    ticket_id: Optional[str] = None
+    request: str
+ 
+def get_ticket_counts():
+    new_tickets = tickets_collection.count_documents({"updates.status": "To Do"})
+    in_progress_tickets = tickets_collection.count_documents({"updates.status": "In Progress"})
+    completed_tickets = tickets_collection.count_documents({"updates.status": "Done"}) + tickets_collection.count_documents({"updates.status": "Closed"})
+    failed_tickets = tickets_collection.count_documents({"updates.status": "Failed"})
+    return {
+        "new": new_tickets,
+        "in_progress": in_progress_tickets,
+        "completed": completed_tickets,
+        "failed": failed_tickets
+    }
 
 @app.post("/send-request")
 async def send_request(admin_request: AdminRequest):
@@ -644,18 +813,54 @@ async def send_request(admin_request: AdminRequest):
         kernel.add_plugin(EmailSenderPlugin(), plugin_name="email_sender")
         kernel.add_plugin(ADOPlugin(), plugin_name="ado")
         kernel.add_plugin(GitPlugin(), plugin_name="git")
-        agent = SKAgent(kernel, tickets_collection)  # Pass tickets_collection
-
-        result = await agent.process_admin_request(admin_request.ticket_id, admin_request.request)
+        kernel.add_plugin(AWSPlugin(), plugin_name="aws")
+        agent = SKAgent(kernel, tickets_collection)
+ 
+        processed_ticket_id = None
+        if admin_request.ticket_id:
+            if admin_request.ticket_id.startswith("TKT-"):
+                try:
+                    processed_ticket_id = int(admin_request.ticket_id.split("-")[1])
+                except ValueError:
+                    raise HTTPException(status_code=400, detail="Invalid ticket ID format. Expected 'TKT-XXX'.")
+            else:
+                try:
+                    processed_ticket_id = int(admin_request.ticket_id)
+                except ValueError:
+                    raise HTTPException(status_code=400, detail="Invalid ticket ID format. Expected 'TKT-XXX' or a number.")
+ 
+        lower_request = admin_request.request.lower()
+ 
+        # --- NEW LOGIC: Handle general status queries directly ---
+        if processed_ticket_id is None and ("status" in lower_request or "summarize" in lower_request or "total tickets" in lower_request or "overview" in lower_request):
+            counts = get_ticket_counts()
+            response_message = (
+                f"Current ticket statuses:\n"
+                f"- New: {counts['new']}\n"
+                f"- Completed: {counts['completed']}\n"
+                f"- In Progress: {counts['in_progress']}\n"
+                f"- Failed: {counts['failed']}"
+            )
+            return {
+                "status": "success",
+                "summary_intent": "general_status_summary", # A new intent type
+                "response": response_message
+            }
+ 
+        # Original logic: Call the agent for specific ticket queries or other complex requests
+        result = await agent.process_admin_request(processed_ticket_id, admin_request.request)
         return {
             "status": "success",
             "summary_intent": result["summary_intent"],
             "response": result["email_response"]
         }
+    except HTTPException as e:
+        raise e
     except Exception as e:
         logger.error(f"Error in /send-request endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
-
+ 
+ 
 @app.get("/stop-agent")
 async def stop_agent():
     """Stop the email and ticket tracking agent."""
