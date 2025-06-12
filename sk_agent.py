@@ -8,12 +8,13 @@ from semantic_kernel import Kernel
 from openai import AzureOpenAI
 from bs4 import BeautifulSoup
 from pymongo.collection import Collection
+from pymilvus import connections, Collection
+from sentence_transformers import SentenceTransformer
 from aws import AWSPlugin
 import re
 from task_manager import TaskManager
 from typing import Dict
 from monitor import MonitorPlugin
-
 
 # Configure logging
 logging.basicConfig(
@@ -40,10 +41,246 @@ class SKAgent:
         if "monitor" not in self.kernel.plugins:
             self.kernel.add_plugin(MonitorPlugin(), plugin_name="monitor")
             logger.info("Registered MonitorPlugin in SKAgent")
-        logger.info("Initialized SKAgent with AzureOpenAI client and AWS plugin")
-        logger.debug(f"Monitor plugin available at init: {'monitor' in self.kernel.plugins}")
-        if 'monitor' in self.kernel.plugins:
-            logger.debug(f"Monitor plugin functions: {list(self.kernel.plugins['monitor'].functions.keys())}")
+            
+        # Initialize Milvus connection and sentence transformer model
+        self.milvus_collection_name = "ticket_details"
+        try:
+            connections.connect(host="localhost", port="19530")
+            logger.info("Connected to Milvus successfully")
+            
+            # Import pymilvus components before using DataType
+            from pymilvus import utility, FieldSchema, CollectionSchema, DataType
+            
+            # Define expected schema fields
+            expected_fields = [
+                {"name": "ado_ticket_id", "dtype": DataType.INT64, "is_primary": True},
+                {"name": "ticket_title", "dtype": DataType.VARCHAR, "max_length": 255},
+                {"name": "ticket_description", "dtype": DataType.VARCHAR, "max_length": 65535},
+                {"name": "updates", "dtype": DataType.VARCHAR, "max_length": 65535},
+                {"name": "embedding", "dtype": DataType.FLOAT_VECTOR, "dim": 384}  # Dimension for all-MiniLM-L6-v2
+            ]
+            
+            # Check if collection exists and has correct schema
+            collection_valid = False
+            if utility.has_collection(self.milvus_collection_name):
+                collection = Collection(self.milvus_collection_name)
+                schema = collection.schema
+                actual_fields = [(f.name, f.dtype, f.is_primary, f.params.get('max_length', 0), f.params.get('dim', None)) for f in schema.fields]
+                expected_fields_set = set((f["name"], f["dtype"], f.get("is_primary", False), f.get("max_length", 0), f.get("dim", None)) for f in expected_fields)
+                actual_fields_set = set(actual_fields)
+                
+                if actual_fields_set == expected_fields_set:
+                    collection_valid = True
+                    logger.info(f"Collection {self.milvus_collection_name} has valid schema")
+                else:
+                    logger.warning(f"Collection {self.milvus_collection_name} has incorrect schema, dropping and recreating")
+                    utility.drop_collection(self.milvus_collection_name)
+            
+            if not collection_valid:
+                logger.info(f"Collection {self.milvus_collection_name} does not exist or is invalid, creating it")
+                fields = [
+                    FieldSchema(name="ado_ticket_id", dtype=DataType.INT64, is_primary=True),
+                    FieldSchema(name="ticket_title", dtype=DataType.VARCHAR, max_length=255),
+                    FieldSchema(name="ticket_description", dtype=DataType.VARCHAR, max_length=65535),
+                    FieldSchema(name="updates", dtype=DataType.VARCHAR, max_length=65535),
+                    FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=384)
+                ]
+                schema = CollectionSchema(fields=fields, description="Ticket details for RAG")
+                self.milvus_collection = Collection(name=self.milvus_collection_name, schema=schema)
+                logger.info(f"Created collection {self.milvus_collection_name}")
+                
+                # Create index for embedding field
+                index_params = {
+                    "metric_type": "L2",
+                    "index_type": "IVF_FLAT",
+                    "params": {"nlist": 1024}
+                }
+                self.milvus_collection.create_index(field_name="embedding", index_params=index_params)
+                logger.info(f"Created index on embedding field for collection {self.milvus_collection_name}")
+            
+            else:
+                self.milvus_collection = Collection(self.milvus_collection_name)
+                # Check if index exists, create if not
+                if not self.milvus_collection.has_index():
+                    logger.info(f"No index found for collection {self.milvus_collection_name}, creating index")
+                    index_params = {
+                        "metric_type": "L2",
+                        "index_type": "IVF_FLAT",
+                        "params": {"nlist": 1024}
+                    }
+                    self.milvus_collection.create_index(field_name="embedding", index_params=index_params)
+                    logger.info(f"Created index on embedding field for collection {self.milvus_collection_name}")
+            
+            self.milvus_collection.load()
+            logger.info(f"Loaded collection {self.milvus_collection_name}")
+            
+        except Exception as e:
+            logger.error(f"Failed to connect to Milvus or initialize collection: {str(e)}")
+            raise
+        
+        try:
+            self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+            logger.info("Initialized sentence-transformers model")
+        except Exception as e:
+            logger.error(f"Failed to initialize sentence-transformers: {str(e)}")
+            raise
+        
+        logger.info("Initialized SKAgent with AzureOpenAI client, AWS plugin, and Milvus")
+
+    async def send_to_milvus(self, ticket: dict):
+        """Send or update ticket details in Milvus for RAG."""
+        try:
+            ado_ticket_id = ticket.get("ado_ticket_id")
+            if not ado_ticket_id:
+                logger.warning("No ado_ticket_id provided, skipping Milvus operation")
+                return
+
+            ticket_title = ticket.get("ticket_title", "")
+            ticket_description = ticket.get("ticket_description", "")
+            updates = json.dumps(ticket.get("updates", []))
+
+            # Generate embedding
+            text_to_embed = f"{ticket_title} {ticket_description} {updates}"
+            embedding = self.embedding_model.encode(text_to_embed).tolist()
+
+            # Prepare data for upsert
+            data = [
+                [ado_ticket_id],
+                [ticket_title],
+                [ticket_description],
+                [updates],
+                [embedding]
+            ]
+
+            # Check if ticket exists in Milvus
+            self.milvus_collection.load()
+            results = self.milvus_collection.query(
+                expr=f"ado_ticket_id == {ado_ticket_id}",
+                output_fields=["ado_ticket_id"]
+            )
+
+            if results:
+                # Update existing entry
+                self.milvus_collection.delete(expr=f"ado_ticket_id == {ado_ticket_id}")
+                logger.info(f"Deleted old Milvus entry for ticket ID={ado_ticket_id} before upsert")
+                self.milvus_collection.insert(data)
+                logger.info(f"Updated ticket ID={ado_ticket_id} in Milvus with new updates")
+            else:
+                # Insert new entry
+                self.milvus_collection.insert(data)
+                logger.info(f"Inserted new ticket ID={ado_ticket_id} in Milvus")
+
+            # Update MongoDB with in_milvus flag
+            self.tickets_collection.update_one(
+                {"ado_ticket_id": ado_ticket_id},
+                {"$set": {"in_milvus": True}}
+            )
+
+        except Exception as e:
+            logger.error(f"Error in Milvus operation for ticket {ado_ticket_id}: {str(e)}")
+
+    async def search_milvus_for_solution(self, ticket_title: str, ticket_description: str, comments: str = "") -> tuple[bool, dict | None]:
+        """Search Milvus for tickets similar to the given ticket_title, ticket_description, and comments."""
+        try:
+            # Combine title, description, and comments for embedding
+            text_to_embed = f"{ticket_title} {ticket_description} {comments}".strip()
+            embedding = self.embedding_model.encode(text_to_embed).tolist()
+            search_params = {"metric_type": "L2", "params": {"nprobe": 10}}
+            results = self.milvus_collection.search(
+                data=[embedding],
+                anns_field="embedding",
+                param=search_params,
+                limit=3,
+                output_fields=["ado_ticket_id", "ticket_title", "ticket_description", "updates"]
+            )
+
+            found_match = False
+            threshold = 1.5  # Relaxed threshold for better match detection
+            best_match = None
+            min_distance = float('inf')
+
+            for hits in results:
+                for hit in hits:
+                    logger.info(f"Search hit: ado_ticket_id={hit.entity.get('ado_ticket_id')}, distance={hit.distance}")
+                    ticket_data = {
+                        "ado_ticket_id": hit.entity.get('ado_ticket_id'),
+                        "ticket_title": hit.entity.get('ticket_title'),
+                        "ticket_description": hit.entity.get('ticket_description'),
+                        "updates": hit.entity.get('updates')
+                    }
+                    if hit.distance < threshold and hit.distance < min_distance:
+                        found_match = True
+                        min_distance = hit.distance
+                        best_match = ticket_data
+
+            if found_match:
+                logger.info(f"Found matching ticket: ado_ticket_id={best_match['ado_ticket_id']}, distance={min_distance}")
+            else:
+                logger.info("No matching ticket found in Milvus")
+            return (found_match, best_match)
+
+        except Exception as e:
+            logger.error(f"Error searching Milvus: {str(e)}")
+            return (False, None)
+
+    async def restructure_remediation_from_milvus(self, matching_ticket: dict, user_name: str) -> str:
+        """Extract all remediation steps from matching ticket's updates and restructure using LLM."""
+        try:
+            ticket_id = matching_ticket.get("ado_ticket_id", "Unknown")
+            updates = json.loads(matching_ticket.get("updates", "[]"))
+            
+            # Log raw updates for debugging
+            logger.info(f"Raw updates for ticket ID={ticket_id}: {updates}")
+            
+            # Collect all non-placeholder comments from updates
+            remediation_steps = []
+            for update in updates:
+                comment = update.get("comment", "")
+                if comment and comment != "No comment provided":
+                    # Clean HTML tags
+                    soup = BeautifulSoup(comment, "html.parser")
+                    cleaned_comment = soup.get_text().strip()
+                    if cleaned_comment:
+                        remediation_steps.append(cleaned_comment)
+            
+            if not remediation_steps:
+                logger.warning(f"No valid remediation steps found in updates for ticket ID={ticket_id}")
+                return ""
+
+            # Join all steps for LLM input
+            raw_remediation = "\n".join(remediation_steps)
+            logger.info(f"Collected remediation steps for ticket ID={ticket_id}: {raw_remediation}")
+            
+            # LLM prompt to restructure steps
+            remediation_prompt = (
+                f"You are an IT support assistant. Restructure the following IT remediation steps into a concise numbered list. "
+                "Use a polite and professional tone, with clear, actionable steps suitable for a non-technical user. "
+                "Combine related steps and remove redundancies while preserving all unique actions. "
+                "Include only the numbered steps, without a greeting or closing signature. "
+                f"Raw Remediation Steps:\n{raw_remediation}\n"
+                "Example Output:\n"
+                "1. Restart your Citrix Workspace application.\n"
+                "2. Check your internet connection by restarting your router.\n"
+                "3. Contact IT if the issue persists."
+            )
+
+            response = self.client.chat.completions.create(
+                model=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
+                messages=[
+                    {"role": "system", "content": "You are an IT support assistant."},
+                    {"role": "user", "content": remediation_prompt}
+                ],
+                temperature=0.2,
+                max_tokens=250
+            )
+
+            restructured = response.choices[0].message.content.strip()
+            logger.info(f"Restructured remediation for ticket ID={ticket_id}: {restructured}")
+            return restructured
+
+        except Exception as e:
+            logger.error(f"Error restructuring remediation for ticket ID={ticket_id}: {str(e)}")
+            return ""
             
     async def analyze_intent(self, subject: str, body: str, attachments: list = None) -> dict:
         """Analyze email intent using Azure OpenAI, relying on contextual understanding."""
@@ -292,7 +529,7 @@ class SKAgent:
                 "enable_cloudwatch_monitoring": False
             }
 
-    async def perform_action(self, intent: str, details: dict, fix_event: asyncio.Event = None, broadcast=None, email_id=None) -> dict:
+    async def perform_action(self, intent: str, details: dict, fix_event: asyncio.Event = None, broadcast=None, email_id=None, thread_id=None) -> dict:
         """Perform the action corresponding to the intent."""
         max_attempts = 3
         retry_delay = 20  # seconds
@@ -504,7 +741,7 @@ class SKAgent:
                 results = []
                 for action in details.get("actions", []):
                     sub_intent = next((si["intent"] for si in details.get("sub_intents", []) if si["intent"] in action["action"]), action["action"])
-                    sub_result = await self.perform_action(sub_intent, details, broadcast=broadcast, email_id=email_id)
+                    sub_result = await self.perform_action(sub_intent, details, broadcast=broadcast, email_id=email_id, thread_id=thread_id)
                     results.append(sub_result)
                     if not sub_result["success"]:
                         logger.warning(f"Sub-action {sub_intent} failed: {sub_result['message']}")
@@ -527,66 +764,82 @@ class SKAgent:
             return {"success": False, "message": f"Failed to perform action: {str(e)}", "status": "failed"}
         
     async def generate_summary_response(self, ticket_record: dict, user_request: str, request_source: str = "email") -> dict:
-        """Generate a summary or response based on the MongoDB ticket record, tailored for email or UI."""
+        """Generate a summary or response based on the MongoDB ticket record, tailored for email or UI, including only ServiceNow updates and GitHub actions."""
         try:
-            ticket_id = ticket_record.get("ado_ticket_id", "Unknown")
+            ticket_id = ticket_record.get("servicenow_sys_id", "Unknown")
             subject = ticket_record.get("subject", "Unknown Request")
             email_chain = ticket_record.get("email_chain", [])
             updates = ticket_record.get("updates", [])
             details = ticket_record.get("details", {})
+            github_actions = details.get("github", [])
+
+            # Filter updates to include only ServiceNow updates
+            servicenow_updates = [u for u in updates if u.get("source") == "servicenow"]
+            # Extract GitHub actions for inclusion in the summary
+            github_updates = [
+                f"- {action['message']} (Repo: {action['repo_name']}, User: {action['username']}, Status: {action['status'].capitalize()}) on {action.get('email_timestamp', 'Unknown')}"
+                for action in github_actions
+            ]
 
             # Prepare content for LLM
             email_chain_text = "\n".join(
                 f"From: {e['from']}\nSubject: {e['subject']}\nTimestamp: {e['timestamp']}\nBody: {e['body']}\n"
                 for e in email_chain
-            )
+            ) if email_chain else "No email chain available."
             updates_text = "\n".join(
-                f"Status: {u['status']}\nComment: {u['comment']}\nRevision: {u['revision_id']}\nTimestamp: {u['email_timestamp']}"
-                for u in updates
-            )
-            details_text = json.dumps(details, indent=2)
+                f"Field: {u['field']}\nNew Value: {u['new_value']}\nTimestamp: {u['sys_updated_on']}"
+                for u in servicenow_updates
+            ) if servicenow_updates else "No ServiceNow updates recorded."
+            github_updates_text = "\n".join(github_updates) if github_updates else "No GitHub actions recorded."
+            details_text = json.dumps(details, indent=2) if details else "{}"
 
             if request_source == "email":
                 prompt = (
                     "You are an IT support assistant generating a concise, conversational email response summarizing a user's request. "
-                    "The user has asked for a summary or details about a previous IT request, identified by a ticket record. "
-                    "Use the provided ticket record (email chain, updates, and details) to create a natural, friendly email. "
-                    "Include the ticket ID, a brief summary of the request, key actions taken with their timestamps, and current status. "
-                    "Use timestamps from updates and email_chain to specify when key events occurred (e.g., access granted, revoked). "
-                    "Do not mention analyzing the ticket record or the LLM process. "
+                    "The user has asked for a summary of a previous IT request, identified by a ticket record. "
+                    "Include only updates from ServiceNow (e.g., work notes, state changes, resolution codes) and GitHub actions (e.g., access granted/revoked). "
+                    "Do NOT include any Azure DevOps (ADO) updates, status, or references. "
+                    "Create a natural, friendly email with the ServiceNow ticket ID, a brief summary of the request based on the email chain, key ServiceNow updates with timestamps, and GitHub actions with status and timestamps. "
+                    "If no ServiceNow updates or GitHub actions are available, state that no actions have been recorded yet. "
+                    "Use timestamps from ServiceNow updates (sys_updated_on) and GitHub actions to specify when key events occurred. "
                     "Keep the tone professional yet approachable, as if written by a real IT support agent named Agent. "
-                    "Return JSON: {'summary_intent', 'email_response'}.\n\n"
+                    "Return JSON: {'summary_intent': 'summary_provided', 'email_response': '<response>'}.\n\n"
                     f"User Request: {user_request}\n"
-                    f"Ticket ID: {ticket_id}\n"
+                    f"ServiceNow Ticket ID: {ticket_id}\n"
                     f"Subject: {subject}\n"
                     f"Email Chain:\n{email_chain_text}\n"
-                    f"Updates:\n{updates_text}\n"
+                    f"ServiceNow Updates:\n{updates_text}\n"
+                    f"GitHub Actions:\n{github_updates_text}\n"
                     f"Details:\n{details_text}\n\n"
-                    "Examples:\n"
-                    "1. User Request: Can you give a quick summary of the poc access request?\n"
-                    "   ```json\n{\"summary_intent\": \"summary_provided\", \"email_response\": \"Hi,\\n\\nThanks for reaching out! Here's a quick summary of your request (ticket #147):\\n\\n- Initial Request: You asked to grant read access to the 'poc' repo for testuser9731 on April 29, 2025, at 23:38:46.\\n- Actions Taken: Pull access was granted on April 29, 2025, at 23:38:52. You requested revocation on April 29, 2025, at 23:39:15, which was completed at 23:39:29.\\n- Current Status: The ticket is marked as done as of April 29, 2025, at 23:39:33.\\n\\nLet me know if you need more details!\\n\\nBest,\\nAgent\\nIT Support\"}\n```\n"
+                    "Example:\n"
+                    "User Request: Can you give a quick summary of the poc access request?\n"
+                    "```json\n"
+                    "{\"summary_intent\": \"summary_provided\", \"email_response\": \"Hi,\\n\\nThanks for reaching out! Here's a quick summary of your ServiceNow request (ticket #{ticket_id}):\\n\\n- Initial Request: You asked to grant read access to the 'poc' repo for testuser9731 on 2025-06-05 at 22:55:41.\\n- ServiceNow Updates:\\n  - Work note added on 2025-06-05 at 18:32:28: Pull access granted to testuser9731 for poc.\\n- GitHub Actions:\\n  - Pull access granted on 2025-06-05 at 22:56:17 (Status: Completed).\\n- Current Status: In progress as per the latest ServiceNow update.\\n\\nLet me know if you need more details!\\n\\nBest,\\nAgent\\nIT Support\"}\n"
+                    "```\n"
                     "Output format:\n"
                     "```json\n{\"summary_intent\": \"summary_provided\", \"email_response\": \"<response>\"}\n```"
                 )
             else:  # request_source == "ui"
                 prompt = (
                     "You are an IT support admin generating a concise summary of a ticket for an admin dashboard. "
-                    "The admin has requested a summary or update about a previous IT request, identified by a ticket record. "
-                    "Use the provided ticket record (email chain, updates, and details) to create a brief, professional summary. "
-                    "Include the ticket ID, request type, key actions with timestamps, and current status in bullet points or raw text. "
-                    "Use timestamps from updates and email_chain to specify when key events occurred (e.g., access granted, revoked). "
-                    "Do not format as an email; the response should be formal and suitable for an IT admin reviewing ticket details. "
-                    "Do not mention analyzing the ticket record or the LLM process. "
-                    "Return JSON: {'summary_intent', 'email_response'} where 'email_response' is the summary text.\n\n"
+                    "Include only updates from ServiceNow (e.g., work notes, state changes, resolution codes) and GitHub actions (e.g., access granted/revoked). "
+                    "Do NOT include any Azure DevOps (ADO) updates, status, or references. "
+                    "Create a brief, professional summary with the ServiceNow ticket ID, request type, key ServiceNow updates with timestamps, and GitHub actions with status and timestamps in bullet points. "
+                    "If no ServiceNow updates or GitHub actions are available, state that no actions have been recorded yet. "
+                    "Use timestamps from ServiceNow updates (sys_updated_on) and GitHub actions to specify when key events occurred. "
+                    "Return JSON: {'summary_intent': 'summary_provided', 'email_response': '<summary>'}.\n\n"
                     f"User Request: {user_request}\n"
-                    f"Ticket ID: {ticket_id}\n"
+                    f"ServiceNow Ticket ID: {ticket_id}\n"
                     f"Subject: {subject}\n"
                     f"Email Chain:\n{email_chain_text}\n"
-                    f"Updates:\n{updates_text}\n"
+                    f"ServiceNow Updates:\n{updates_text}\n"
+                    f"GitHub Actions:\n{github_updates_text}\n"
                     f"Details:\n{details_text}\n\n"
-                    "Examples:\n"
-                    "1. User Request: Can you give a quick summary of the poc access request?\n"
-                    "   ```json\n{\"summary_intent\": \"summary_provided\", \"email_response\": \"Ticket #147 Summary:\\n- Request Type: GitHub Access\\n- Initial Request: Grant read access to 'poc' repo for testuser9731 on April 29, 2025, at 23:38:46.\\n- Actions: Pull access granted on April 29, 2025, at 23:38:52. Access revoked on April 29, 2025, at 23:39:29 after user request on April 29, 2025, at 23:39:15.\\n- Status: Done as of April 29, 2025, at 23:39:33.\"}\n```\n"
+                    "Example:\n"
+                    "User Request: Can you give a quick summary of the poc access request?\n"
+                    "```json\n"
+                    "{\"summary_intent\": \"summary_provided\", \"email_response\": \"ServiceNow Ticket #{ticket_id} Summary:\\n- Request Type: GitHub Access\\n- Initial Request: Grant read access to 'poc' repo for testuser9731 on 2025-06-05 at 22:55:41.\\n- ServiceNow Updates:\\n  - Work note added on 2025-06-05 at 18:32:28: Pull access granted to testuser9731 for poc.\\n- GitHub Actions:\\n  - Pull access granted on 2025-06-05 at 22:56:17 (Status: Completed).\\n- Status: In Progress as per latest ServiceNow update.\"}\n"
+                    "```\n"
                     "Output format:\n"
                     "```json\n{\"summary_intent\": \"summary_provided\", \"email_response\": \"<summary>\"}\n```"
                 )
@@ -598,23 +851,39 @@ class SKAgent:
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.2,
-                max_tokens=300
+                max_tokens=600  # Increased to accommodate longer responses
             )
 
             result = response.choices[0].message.content.strip()
+            if not result:
+                raise ValueError("Empty response from Azure OpenAI API")
+
+            # Handle JSON formatting
             if result.startswith("```json") and result.endswith("```"):
                 result = result[7:-3].strip()
+            elif not result.startswith("{"):
+                logger.error(f"Malformed response from Azure OpenAI API: {result}")
+                raise ValueError(f"Invalid JSON response: {result}")
 
-            parsed_result = json.loads(result)
-            logger.info(f"Generated summary response for ticket ID={ticket_id} (source={request_source}): {parsed_result['summary_intent']}")
+            try:
+                parsed_result = json.loads(result)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON response: {result}, Error: {str(e)}")
+                raise ValueError(f"Invalid JSON format in response: {str(e)}")
+
+            # Validate required fields
+            if "summary_intent" not in parsed_result or "email_response" not in parsed_result:
+                raise ValueError(f"Missing required fields in response: {result}")
+
+            logger.info(f"Generated summary response for ServiceNow ticket ID={ticket_id} (source={request_source}): {parsed_result['summary_intent']}")
             return parsed_result
         except Exception as e:
-            logger.error(f"Error generating summary for ticket ID={ticket_id}: {str(e)}")
+            logger.error(f"Error generating summary for ServiceNow ticket ID={ticket_id}: {str(e)}")
             if request_source == "email":
                 return {
                     "summary_intent": "error",
                     "email_response": (
-                        f"Hi,\n\nI couldn't generate a summary for your request due to an issue. "
+                        f"Hi,\n\nI couldn't generate a summary for your ServiceNow request (ticket #{ticket_id}) due to an issue. "
                         f"Please provide more details or contact IT support for assistance.\n\nBest,\nAgent\nIT Support"
                     )
                 }
@@ -622,27 +891,24 @@ class SKAgent:
                 return {
                     "summary_intent": "error",
                     "email_response": (
-                        f"Error generating summary for ticket #{ticket_id}: {str(e)}. "
+                        f"Error generating summary for ServiceNow ticket #{ticket_id}: {str(e)}. "
                         f"Please check the ticket details or contact support."
                     )
                 }
-    async def analyze_ticket_update(self, ticket_id: int, ado_updates: list, servicenow_updates: list = None, attachments: list = None) -> dict:
-        """Analyze ADO and ServiceNow ticket updates and generate email response with remediation if attachments are present."""
+    # Relevant section of analyze_ticket_update function
+    async def analyze_ticket_update(self, ticket_id: str, ado_updates: list, servicenow_updates: list = None, attachments: list = None) -> dict:
+        """Analyze ServiceNow ticket updates and generate email response with remediation if attachments are present, excluding ADO updates from email."""
         try:
-            ticket_description = f"Ticket ID: {ticket_id} (ADO), ServiceNow ID: {servicenow_updates[0]['sys_id'] if servicenow_updates else 'N/A'} - IT support request"
+            # Use ticket_id (sys_id) directly since it's provided
+            ticket_description = f"Ticket ID: {ticket_id} (ServiceNow ID: {ticket_id}) - IT support request"
             
-            # Process ADO updates
-            ado_update_content = []
-            for u in ado_updates:
-                comment = u.get('comment', 'No comment provided.')
-                status = u.get('status', 'Unknown')
-                revision_id = u.get('revision_id', 'N/A')
-                ado_update_content.append(f"ADO Update - Comment: {comment}, Status: {status}, Revision: {revision_id}")
-            
-            # Process ServiceNow updates
+            # Process ServiceNow updates only for email content
             servicenow_update_content = []
             if servicenow_updates:
                 for u in servicenow_updates:
+                    if not isinstance(u, dict):
+                        logger.warning(f"Invalid update format in servicenow_updates: {u}")
+                        continue
                     field = u.get('field', 'Unknown')
                     old_value = u.get('old_value', 'N/A')
                     new_value = u.get('new_value', 'N/A')
@@ -663,18 +929,18 @@ class SKAgent:
                         f"ServiceNow Update - {field_name}: Changed from '{old_value}' to '{new_value}' (Updated: {sys_updated_on})"
                     )
             
-            # Combine updates
-            update_text = "\n".join(ado_update_content + servicenow_update_content) if servicenow_update_content else "\n".join(ado_update_content)
+            # Combine only ServiceNow updates for email
+            update_text = "\n".join(servicenow_update_content) if servicenow_update_content else "No new ServiceNow updates."
             attachment_info = ""
             remediation = ""
 
             if attachments:
-                attachment_info = f"Attachments: {', '.join(a['filename'] for a in attachments)}"
+                attachment_info = f"Attachments: {', '.join(a['filename'] for a in attachments if isinstance(a, dict) and 'filename' in a)}"
                 remediation_prompt = (
                     "You are an IT support assistant generating troubleshooting steps based on image attachments. "
                     "Provide 3-5 concise, actionable steps to help the user troubleshoot the issue. "
                     "Format as a numbered list. "
-                    f"Attachments: {', '.join(a['filename'] for a in attachments)}\n"
+                    f"Attachments: {', '.join(a['filename'] for a in attachments if isinstance(a, dict) and 'filename' in a)}\n"
                     "Return only the numbered list as plain text."
                 )
                 remediation_response = self.client.chat.completions.create(
@@ -691,33 +957,32 @@ class SKAgent:
             prompt = (
                 "You are a helpful IT support admin named Agent writing a personalized email reply to a user. "
                 "Create a natural, conversational response as if you're a real IT support person. "
-                "Include ADO ticket ID and ServiceNow ID (if available). "
-                "List all updates from ADO (comments, status changes) and ServiceNow (field changes like state, caller, work notes, resolution codes, etc.) in a clear, structured format using bullet points. "
-                "If no updates are provided, state that no changes have occurred. "
+                "Include only ServiceNow ticket ID and updates (field changes like state, caller, work notes, resolution codes, etc.) in a clear, structured format using bullet points. "
+                "Exclude any Azure DevOps (ADO) updates or references from the email response. "
+                "If no ServiceNow updates are provided, state that no changes have occurred. "
                 "If attachments are present, mention they are included for reference. "
                 "Sound friendly and helpful, use first-person, and vary your language. "
                 "Keep it concise but complete. "
+                "Do NOT include a closing signature (e.g., 'Best regards', 'Cheers') as it will be added later. "
                 "Return JSON: {'update_intent', 'email_response', 'remediation'}.\n\n"
                 f"Ticket Description: {ticket_description}\n"
                 f"Updates:\n{update_text}\n"
                 f"{attachment_info}\n\n"
                 "Examples:\n"
-                "1. Updates: ADO Update - Comment: Access granted, Status: Doing, Revision: 2\n"
-                "   ServiceNow Update - State: Changed from 'New' to 'In Progress' (Updated: 2025-06-05)\n"
+                "1. Updates: ServiceNow Update - State: Changed from 'New' to 'In Progress' (Updated: 2025-06-05)\n"
                 "   ServiceNow Update - Work Notes: Changed from 'N/A' to 'Started investigation' (Updated: 2025-06-05)\n"
                 "   ```json\n"
                 "{\"update_intent\": \"action_completed\", "
-                "\"email_response\": \"Hi there,\\n\\nI've got an update on your ticket #123 (ADO) and ServiceNow ID: INC001! Here's what's happened:\\n"
-                "- ADO: Access was granted, and the ticket is now in 'Doing' status.\\n"
-                "- ServiceNow: The state changed from 'New' to 'In Progress'.\\n"
-                "- ServiceNow: Added work notes: 'Started investigation'.\\n\\n"
-                "Let me know if you need anything else!\\n\\nCheers,\\nAgent\\nIT Support\", "
+                "\"email_response\": \"Hi there,\\n\\nI've got an update on your ServiceNow ticket (ID: INC001)! Here's what's happened:\\n"
+                "- State changed from 'New' to 'In Progress'.\\n"
+                "- Added work notes: 'Started investigation'.\\n\\n"
+                "Let me know if you need anything else!\", "
                 "\"remediation\": \"\"}\n```\n"
                 "2. Updates: None\n"
                 "   ```json\n"
                 "{\"update_intent\": \"no_update_provided\", "
-                "\"email_response\": \"Hi there,\\n\\nJust checking in on your ticket #123 (ADO) and ServiceNow ID: INC001. "
-                "No new updates have been made yet. I'll keep you posted when something changes!\\n\\nBest,\\nAgent\\nIT Support\", "
+                "\"email_response\": \"Hi there,\\n\\nJust checking in on your ServiceNow ticket (ID: INC001). "
+                "No new updates have been made yet. I'll keep you posted when something changes!\", "
                 "\"remediation\": \"\"}\n```\n"
                 "Output format:\n"
                 "```json\n{\"update_intent\": \"<intent>\", \"email_response\": \"<response>\", \"remediation\": \"<remediation>\"}\n```"
@@ -730,7 +995,7 @@ class SKAgent:
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.2,
-                max_tokens=600  # Increased to accommodate detailed updates
+                max_tokens=600
             )
 
             result = response.choices[0].message.content.strip()
@@ -743,13 +1008,10 @@ class SKAgent:
             return parsed_result
         except Exception as e:
             logger.error(f"Error analyzing ticket update for ticket ID={ticket_id}: {str(e)}")
-            ado_status = ado_updates[-1].get('status', 'Unknown') if ado_updates else 'Unknown'
-            sn_state = servicenow_updates[-1].get('new_value', 'Unknown') if servicenow_updates and servicenow_updates[-1].get('field') == 'state' else 'Unknown'
             email_response = (
-                f"Dear User,\n\nYour ticket (ADO ID: {ticket_id}, ServiceNow ID: {servicenow_updates[0]['sys_id'] if servicenow_updates else 'N/A'}) "
-                f"is currently in '{ado_status}' (ADO) and '{sn_state}' (ServiceNow) status. "
-                "We encountered an issue processing the latest updates. Please contact IT Support for assistance.\n\n"
-                "Best regards,\nAgent\nIT Support Team"
+                f"Dear User,\n\nYour ServiceNow ticket (ID: {ticket_id}) "
+                f"is currently in an unknown status. "
+                "We encountered an issue processing the latest updates. Please contact IT Support for assistance."
             )
             return {
                 "update_intent": "error",
@@ -839,9 +1101,6 @@ class SKAgent:
 
     async def process_email(self, email: dict, broadcast, existing_ticket: dict = None, email_content: str = None) -> dict:
         """Process an email through the workflow: analyze, create/update ticket, perform actions, send reply."""
-        import uuid
-        import asyncio
-        from datetime import datetime
         try:
             email_id = email["id"]
             subject = email["subject"]
@@ -856,7 +1115,8 @@ class SKAgent:
                 "type": "email_detected",
                 "email_id": email_id,
                 "subject": subject,
-                "sender": sender
+                "sender": sender,
+                "thread_id": thread_id
             })
 
             # Analyze intent
@@ -895,7 +1155,8 @@ class SKAgent:
                 "email_id": email_id,
                 "intent": intent,
                 "pending_actions": pending_actions,
-                "enable_cloudwatch_monitoring": enable_cloudwatch_monitoring
+                "enable_cloudwatch_monitoring": enable_cloudwatch_monitoring,
+                "thread_id": thread_id
             })
 
             # Start monitoring before actions for relevant intents
@@ -922,21 +1183,24 @@ class SKAgent:
                             "type": "monitoring_started",
                             "email_id": email_id,
                             "instance_id": details["instance_id"],
-                            "message": f"Started CloudWatch monitoring for instance {details['instance_id']}"
+                            "message": f"Started CloudWatch monitoring for instance {details['instance_id']}",
+                            "thread_id": thread_id
                         })
                     except Exception as e:
                         logger.error(f"Failed to start monitoring for instance {details['instance_id']} after intent analysis: {str(e)}")
                         await broadcast({
                             "type": "error",
                             "email_id": email_id,
-                            "message": f"Failed to start CloudWatch monitoring: {str(e)}"
+                            "message": f"Failed to start CloudWatch monitoring: {str(e)}",
+                            "thread_id": thread_id
                         })
                 else:
                     logger.error("Monitor plugin not found in kernel.plugins")
                     await broadcast({
                         "type": "error",
                         "email_id": email_id,
-                        "message": "Monitor plugin not found for CloudWatch monitoring"
+                        "message": "Monitor plugin not found for CloudWatch monitoring",
+                        "thread_id": thread_id
                     })
 
             # Handle non-intent emails
@@ -955,8 +1219,12 @@ class SKAgent:
                         {"thread_id": thread_id},
                         {"$push": {"email_chain": email_chain_entry}}
                     )
+                    # Update Milvus with the latest ticket data
+                    updated_ticket = self.tickets_collection.find_one({"thread_id": thread_id})
+                    if updated_ticket:
+                        await self.send_to_milvus(updated_ticket)
                 else:
-                    self.tickets_collection.insert_one({
+                    ticket_record = {
                         "ado_ticket_id": None,
                         "servicenow_sys_id": None,
                         "sender": sender,
@@ -977,15 +1245,19 @@ class SKAgent:
                         }],
                         "pending_actions": False,
                         "type_of_request": "non_intent",
-                        "details": {"attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]}
-                    })
+                        "details": {"attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]},
+                        "in_milvus": False
+                    }
+                    self.tickets_collection.insert_one(ticket_record)
+                    # No need to update Milvus for new non-intent tickets unless specified
                 if monitor_task:
                     await self.stop_monitoring(details["instance_id"])
                     await broadcast({
                         "type": "monitoring_stopped",
                         "email_id": email_id,
                         "instance_id": details["instance_id"],
-                        "message": f"Stopped CloudWatch monitoring for instance {details['instance_id']}"
+                        "message": f"Stopped CloudWatch monitoring for instance {details['instance_id']}",
+                        "thread_id": thread_id
                     })
                 return {
                     "status": "success",
@@ -1028,6 +1300,10 @@ class SKAgent:
                         {"thread_id": thread_id},
                         {"$push": {"email_chain": email_chain_entry}}
                     )
+                    # Update Milvus with the latest ticket data
+                    updated_ticket = self.tickets_collection.find_one({"thread_id": thread_id})
+                    if updated_ticket:
+                        await self.send_to_milvus(updated_ticket)
                     await broadcast({
                         "type": "email_reply",
                         "email_id": email_id,
@@ -1040,7 +1316,8 @@ class SKAgent:
                         "type": "monitoring_stopped",
                         "email_id": email_id,
                         "instance_id": details["instance_id"],
-                        "message": f"Stopped CloudWatch monitoring for instance {details['instance_id']}"
+                        "message": f"Stopped CloudWatch monitoring for instance {details['instance_id']}",
+                        "thread_id": thread_id
                     })
                 return {
                     "status": "success",
@@ -1066,6 +1343,8 @@ class SKAgent:
                 "aws_iam_remove_user",
                 "aws_iam_remove_user_permission"
             ]
+
+            sender_username = sender.split('<')[0].strip() if '<' in sender else (sender.split('@')[0] if '@' in sender else sender)
 
             # Handle follow-up emails for actionable intents
             if is_follow_up and intent in [
@@ -1130,7 +1409,7 @@ class SKAgent:
                 }
                 self.tickets_collection.update_one({"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id}, update_operation)
 
-                action_result = await self.perform_action(intent, details, broadcast=broadcast, email_id=email_id)
+                action_result = await self.perform_action(intent, details, broadcast=broadcast, email_id=email_id, thread_id=thread_id)
                 action_details["status"] = action_result.get("status", "failed")
                 action_details["message"] = action_result["message"]
                 if intent == "aws_ec2_launch_instance" and action_result.get("logs"):
@@ -1144,7 +1423,8 @@ class SKAgent:
                         "ado_ticket_id": ado_ticket_id,
                         "servicenow_sys_id": servicenow_sys_id,
                         "success": False,
-                        "message": action_result["message"]
+                        "message": action_result["message"],
+                        "thread_id": thread_id
                     })
 
                 if intent in completion_intents and action_result["success"]:
@@ -1193,7 +1473,8 @@ class SKAgent:
                     "ado_ticket_id": ado_ticket_id,
                     "servicenow_sys_id": servicenow_sys_id,
                     "success": action_result["success"],
-                    "message": action_details["message"]
+                    "message": action_details["message"],
+                    "thread_id": thread_id
                 })
 
                 updated_ticket = self.tickets_collection.find_one({"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id})
@@ -1217,10 +1498,55 @@ class SKAgent:
                     logger.error(f"Failed to update tickets {ado_ticket_id}/{servicenow_sys_id}: {str(e)}")
                     raise ValueError(f"Ticket update failed: {str(e)}")
 
+                # Send email reply for follow-up actionable intent
+                email_response = f"Your request to {intent.replace('_', ' ')} has been processed.\nStatus: {action_details['status']}\nDetails: {action_details['message']}"
+                if intent == "aws_ec2_launch_instance" and action_result.get("logs"):
+                    email_response += f"\n\nEC2 Execution Logs:\n{action_result['logs']}"
+                combined_body = f"Dear {sender_username},\n\n{email_response}\n\nBest regards,\nIT Support Agent"
+
+                reply_result = await self.kernel.invoke(
+                    self.kernel.plugins["email_sender"]["send_reply"],
+                    to=sender,
+                    subject=subject,
+                    body=combined_body,
+                    thread_id=thread_id,
+                    message_id=email_id,
+                    attachments=attachments,
+                    remediation=""
+                )
+                reply = reply_result.value if reply_result else None
+
+                if reply:
+                    email_chain_entry = {
+                        "email_id": reply.get("message_id", str(uuid.uuid4())),
+                        "from": os.getenv('EMAIL_ADDRESS', 'IT Support <support@quadranttechnologies.com>'),
+                        "subject": subject,
+                        "body": combined_body,
+                        "timestamp": datetime.now().isoformat(),
+                        "attachments": []
+                    }
+                    self.tickets_collection.update_one(
+                        {"thread_id": thread_id},
+                        {"$push": {"email_chain": email_chain_entry}}
+                    )
+                    # Update Milvus with the latest ticket data
+                    updated_ticket = self.tickets_collection.find_one({"thread_id": thread_id})
+                    if updated_ticket:
+                        await self.send_to_milvus(updated_ticket)
+                    await broadcast({
+                        "type": "email_reply",
+                        "email_id": email_id,
+                        "thread_id": thread_id
+                    })
+
+                # Update Milvus with the latest ticket data
+                await self.send_to_milvus(updated_ticket)
+
             # Handle git_and_aws_intent for follow-up
             elif is_follow_up and intent == "git_and_aws_intent":
                 ado_ticket_id = existing_ticket["ado_ticket_id"]
                 servicenow_sys_id = existing_ticket["servicenow_sys_id"]
+                email_responses = []
                 for sub_intent in sub_intents:
                     sub_intent_name = sub_intent["intent"]
                     sub_action_details = {
@@ -1293,12 +1619,18 @@ class SKAgent:
                         logger.error(f"Failed to update ticket {ado_ticket_id}/{servicenow_sys_id} for sub-intent {sub_intent_name}: {str(e)}")
                         raise ValueError(f"Ticket update failed: {str(e)}")
 
-                    sub_action_result = await self.perform_action(sub_intent_name, details, broadcast=broadcast, email_id=email_id)
+                    sub_action_result = await self.perform_action(sub_intent_name, details, broadcast=broadcast, email_id=email_id, thread_id=thread_id)
                     sub_action_details["status"] = sub_action_result.get("status", "failed")
                     sub_action_details["message"] = sub_action_result["message"]
                     if sub_intent_name == "aws_ec2_launch_instance" and sub_action_result.get("logs"):
                         sub_action_details["logs"] = sub_action_result["logs"]
                     completed_actions.append({"action": sub_intent_name, "completed": sub_action_result["success"]})
+
+                    # Collect email response for each sub-intent
+                    sub_email_response = f"Sub-request to {sub_intent_name.replace('_', ' ')}:\nStatus: {sub_action_details['status']}\nDetails: {sub_action_details['message']}"
+                    if sub_intent_name == "aws_ec2_launch_instance" and sub_action_result.get("logs"):
+                        sub_email_response += f"\n\nEC2 Execution Logs:\n{sub_action_result['logs']}"
+                    email_responses.append(sub_email_response)
 
                     if sub_intent_name == "aws_ec2_run_script" and not sub_action_result["success"]:
                         await broadcast({
@@ -1307,7 +1639,8 @@ class SKAgent:
                             "ado_ticket_id": ado_ticket_id,
                             "servicenow_sys_id": servicenow_sys_id,
                             "success": False,
-                            "message": sub_action_result["message"]
+                            "message": sub_action_result["message"],
+                            "thread_id": thread_id
                         })
 
                     if sub_intent_name in ["aws_ec2_run_script", "aws_ec2_launch_instance"] and sub_action_result.get("permission_fixed"):
@@ -1316,7 +1649,8 @@ class SKAgent:
                             "email_id": email_id,
                             "ado_ticket_id": ado_ticket_id,
                             "servicenow_sys_id": servicenow_sys_id,
-                            "message": sub_action_result.get("permission_message", "Permission issue fixed")
+                            "message": sub_action_result.get("permission_message", "Permission issue fixed"),
+                            "thread_id": thread_id
                         })
 
                     if sub_intent_name in completion_intents and sub_action_result["success"]:
@@ -1348,7 +1682,8 @@ class SKAgent:
                         "ado_ticket_id": ado_ticket_id,
                         "servicenow_sys_id": servicenow_sys_id,
                         "success": sub_action_result["success"],
-                        "message": sub_action_details["message"]
+                        "message": sub_action_details["message"],
+                        "thread_id": thread_id
                     })
 
                 updated_ticket = self.tickets_collection.find_one({"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id})
@@ -1372,6 +1707,48 @@ class SKAgent:
                     logger.error(f"Failed to update tickets {ado_ticket_id}/{servicenow_sys_id}: {str(e)}")
                     raise ValueError(f"Ticket update failed: {str(e)}")
 
+                # Send email reply for git_and_aws_intent follow-up
+                email_response = "\n\n".join(email_responses)
+                combined_body = f"Dear {sender_username},\n\nYour combined GitHub and AWS requests have been processed:\n\n{email_response}\n\nBest regards,\nIT Support Agent"
+
+                reply_result = await self.kernel.invoke(
+                    self.kernel.plugins["email_sender"]["send_reply"],
+                    to=sender,
+                    subject=subject,
+                    body=combined_body,
+                    thread_id=thread_id,
+                    message_id=email_id,
+                    attachments=attachments,
+                    remediation=""
+                )
+                reply = reply_result.value if reply_result else None
+
+                if reply:
+                    email_chain_entry = {
+                        "email_id": reply.get("message_id", str(uuid.uuid4())),
+                        "from": os.getenv('EMAIL_ADDRESS', 'IT Support <support@quadranttechnologies.com>'),
+                        "subject": subject,
+                        "body": combined_body,
+                        "timestamp": datetime.now().isoformat(),
+                        "attachments": []
+                    }
+                    self.tickets_collection.update_one(
+                        {"thread_id": thread_id},
+                        {"$push": {"email_chain": email_chain_entry}}
+                    )
+                    # Update Milvus with the latest ticket data
+                    updated_ticket = self.tickets_collection.find_one({"thread_id": thread_id})
+                    if updated_ticket:
+                        await self.send_to_milvus(updated_ticket)
+                    await broadcast({
+                        "type": "email_reply",
+                        "email_id": email_id,
+                        "thread_id": thread_id
+                    })
+
+                # Update Milvus with the latest ticket data
+                await self.send_to_milvus(updated_ticket)
+
             # Handle new email
             else:
                 # Create ADO ticket
@@ -1390,7 +1767,8 @@ class SKAgent:
                             "type": "monitoring_stopped",
                             "email_id": email_id,
                             "instance_id": details["instance_id"],
-                            "message": f"Stopped CloudWatch monitoring for instance {details['instance_id']}"
+                            "message": f"Stopped CloudWatch monitoring for instance {details['instance_id']}",
+                            "thread_id": thread_id
                         })
                     return {"status": "error", "message": "ADO ticket creation failed", "actions": [], "pending_actions": False}
 
@@ -1404,7 +1782,7 @@ class SKAgent:
                     title=subject,
                     description=ticket_description,
                     email_content=email_content,
-                    attachments=attachments
+                    attachments=[a for a in attachments if isinstance(a, dict) and "path" in a and "filename" in a]
                 )
                 if not servicenow_ticket_result or not servicenow_ticket_result.value:
                     logger.error(f"Failed to create ServiceNow ticket for email ID={email_id}")
@@ -1423,12 +1801,80 @@ class SKAgent:
                     "servicenow_sys_id": servicenow_sys_id,
                     "ado_url": ado_url,
                     "servicenow_url": servicenow_url,
-                    "intent": intent
+                    "intent": intent,
+                    "thread_id": thread_id
                 })
 
+                # Clean email body for comments
+                cleaned_comments = BeautifulSoup(body, "html.parser").get_text().strip() if "<html>" in body.lower() else body.strip()
+
+                # Initialize remediation for general_it_request
+                remediation = ""
+
+                # Handle general_it_request with Milvus search
+                if intent == "general_it_request":
+                    # Search Milvus for similar tickets
+                    has_matches, matching_ticket = await self.search_milvus_for_solution(subject, ticket_description, cleaned_comments)
+                    ticket_record = {
+                        "ado_ticket_id": ado_ticket_id,
+                        "servicenow_sys_id": servicenow_sys_id,
+                        "sender": sender,
+                        "subject": subject,
+                        "thread_id": thread_id,
+                        "email_id": email_id,
+                        "ticket_title": subject,
+                        "ticket_description": ticket_description,
+                        "email_timestamp": datetime.now().isoformat(),
+                        "updates": [{
+                            "status": "New",
+                            "comment": cleaned_comments,
+                            "revision_id": f"initial-{ado_ticket_id}-1",
+                            "email_sent": False,
+                            "email_message_id": None,
+                            "email_timestamp": datetime.now().isoformat()
+                        }],
+                        "email_chain": [{
+                            "email_id": email_id,
+                            "from": sender,
+                            "subject": subject,
+                            "body": body,
+                            "timestamp": email.get("received", datetime.now().isoformat()),
+                            "attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]
+                        }],
+                        "pending_actions": pending_actions,
+                        "type_of_request": intent,
+                        "details": {"attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]},
+                        "in_milvus": has_matches
+                    }
+
+                    if has_matches:
+                        # Extract and restructure remediation from matching ticket
+                        remediation = await self.restructure_remediation_from_milvus(matching_ticket, sender_username)
+                        ticket_record["remediation"] = remediation
+                    else:
+                        # Store ticket in Milvus if no match found
+                        await self.send_to_milvus(ticket_record)
+
+                    # Update ticket description for general_it_request
+                    detailed_description = f"User {sender_username}: {ticket_description}"
+                    ticket_record["details"]["general"] = [{
+                        "request_type": "general_it_request",
+                        "status": "pending",
+                        "message": detailed_description,
+                        "requester": sender_username
+                    }]
+                    ticket_record["ticket_description"] = detailed_description
+
+                    # Store ticket in MongoDB
+                    try:
+                        self.tickets_collection.insert_one(ticket_record)
+                    except Exception as e:
+                        logger.error(f"Failed to insert ticket record for tickets {ado_ticket_id}/{servicenow_sys_id}: {str(e)}")
+                        raise ValueError(f"Ticket insertion failed: {str(e)}")
+
                 # Perform action for single intent
-                if intent != "git_and_aws_intent" and intent != "general_it_request":
-                    action_result = await self.perform_action(intent, details, broadcast=broadcast, email_id=email_id)
+                elif intent != "git_and_aws_intent":
+                    action_result = await self.perform_action(intent, details, broadcast=broadcast, email_id=email_id, thread_id=thread_id)
                     action_details = {
                         "request_type": intent,
                         "status": action_result.get("status", "failed"),
@@ -1474,7 +1920,8 @@ class SKAgent:
                             "ado_ticket_id": ado_ticket_id,
                             "servicenow_sys_id": servicenow_sys_id,
                             "success": False,
-                            "message": action_result["message"]
+                            "message": action_result["message"],
+                            "thread_id": thread_id
                         })
 
                     if intent in ["aws_ec2_run_script", "aws_ec2_launch_instance"] and action_result.get("permission_fixed"):
@@ -1483,7 +1930,8 @@ class SKAgent:
                             "email_id": email_id,
                             "ado_ticket_id": ado_ticket_id,
                             "servicenow_sys_id": servicenow_sys_id,
-                            "message": action_result.get("permission_message", "Permission issue fixed")
+                            "message": action_result.get("permission_message", "Permission issue fixed"),
+                            "thread_id": thread_id
                         })
 
                     try:
@@ -1510,14 +1958,15 @@ class SKAgent:
                         "ado_ticket_id": ado_ticket_id,
                         "servicenow_sys_id": servicenow_sys_id,
                         "success": action_result["success"],
-                        "message": action_result["message"]
+                        "message": action_details["message"],
+                        "thread_id": thread_id
                     })
 
                 # Handle git_and_aws_intent for new email
                 elif intent == "git_and_aws_intent":
                     for sub_intent in sub_intents:
                         sub_intent_name = sub_intent["intent"]
-                        sub_action_result = await self.perform_action(sub_intent_name, details, broadcast=broadcast, email_id=email_id)
+                        sub_action_result = await self.perform_action(sub_intent_name, details, broadcast=broadcast, email_id=email_id, thread_id=thread_id)
                         sub_action_details = {
                             "request_type": sub_intent_name,
                             "status": sub_action_result.get("status", "failed"),
@@ -1575,7 +2024,8 @@ class SKAgent:
                                 "ado_ticket_id": ado_ticket_id,
                                 "servicenow_sys_id": servicenow_sys_id,
                                 "success": False,
-                                "message": sub_action_result["message"]
+                                "message": sub_action_result["message"],
+                                "thread_id": thread_id
                             })
 
                         if sub_intent_name in ["aws_ec2_run_script", "aws_ec2_launch_instance"] and sub_action_result.get("permission_fixed"):
@@ -1584,7 +2034,8 @@ class SKAgent:
                                 "email_id": email_id,
                                 "ado_ticket_id": ado_ticket_id,
                                 "servicenow_sys_id": servicenow_sys_id,
-                                "message": sub_action_result.get("permission_message", "Permission issue fixed")
+                                "message": sub_action_result.get("permission_message", "Permission issue fixed"),
+                                "thread_id": thread_id
                             })
 
                         try:
@@ -1614,60 +2065,55 @@ class SKAgent:
                             "ado_ticket_id": ado_ticket_id,
                             "servicenow_sys_id": servicenow_sys_id,
                             "success": sub_action_result["success"],
-                            "message": sub_action_details["message"]
+                            "message": sub_action_details["message"],
+                            "thread_id": thread_id
                         })
 
-                # Update ticket in MongoDB
-                ticket_record = {
-                    "ado_ticket_id": ado_ticket_id,
-                    "servicenow_sys_id": servicenow_sys_id,
-                    "sender": sender,
-                    "subject": subject,
-                    "thread_id": thread_id,
-                    "email_id": email_id,
-                    "ticket_title": subject,
-                    "ticket_description": ticket_description,
-                    "email_timestamp": datetime.now().isoformat(),
-                    "updates": [],
-                    "email_chain": [{
-                        "email_id": email_id,
-                        "from": sender,
+                # Update ticket in MongoDB (for non-general_it_request intents)
+                if intent != "general_it_request":
+                    ticket_record = {
+                        "ado_ticket_id": ado_ticket_id,
+                        "servicenow_sys_id": servicenow_sys_id,
+                        "sender": sender,
                         "subject": subject,
-                        "body": body,
-                        "timestamp": email.get("received", datetime.now().isoformat()),
-                        "attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]
-                    }],
-                    "pending_actions": pending_actions,
-                    "type_of_request": intent,
-                    "details": {"attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]}
-                }
-                if action_details:
-                    ticket_record["details"]["aws" if intent.startswith("aws_") else "github"] = [action_details]
-                elif intent == "git_and_aws_intent":
-                    ticket_record["details"]["github"] = [
-                        d for d in completed_actions if d["action"].startswith("github_")
-                    ]
-                    ticket_record["details"]["aws"] = [
-                        d for d in completed_actions if d["action"].startswith("aws_")
-                    ]
-                elif intent == "general_it_request":
-                    sender_username = sender.split('@')[0] if '@' in sender else sender
-                    detailed_description = ticket_description
-                    if sender_username.lower() not in detailed_description.lower():
-                        detailed_description = f"User {sender_username}: {detailed_description}"
-                    ticket_record["details"]["general"] = [{
-                        "request_type": "general_it_request",
-                        "status": "pending",
-                        "message": detailed_description,
-                        "requester": sender_username
-                    }]
-                    ticket_record["ticket_description"] = detailed_description
+                        "thread_id": thread_id,
+                        "email_id": email_id,
+                        "ticket_title": subject,
+                        "ticket_description": ticket_description,
+                        "email_timestamp": datetime.now().isoformat(),
+                        "updates": [],
+                        "email_chain": [{
+                            "email_id": email_id,
+                            "from": sender,
+                            "subject": subject,
+                            "body": body,
+                            "timestamp": email.get("received", datetime.now().isoformat()),
+                            "attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]
+                        }],
+                        "pending_actions": pending_actions,
+                        "type_of_request": intent,
+                        "details": {"attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]},
+                        "in_milvus": False
+                    }
+                    if action_details:
+                        ticket_record["details"]["aws" if intent.startswith("aws_") else "github"] = [action_details]
+                    elif intent == "git_and_aws_intent":
+                        ticket_record["details"]["github"] = [
+                            d for d in completed_actions if d["action"].startswith("github_")
+                        ]
+                        ticket_record["details"]["aws"] = [
+                            d for d in completed_actions if d["action"].startswith("aws_")
+                        ]
+                    try:
+                        self.tickets_collection.insert_one(ticket_record)
+                    except Exception as e:
+                        logger.error(f"Failed to insert ticket record for tickets {ado_ticket_id}/{servicenow_sys_id}: {str(e)}")
+                        raise ValueError(f"Ticket insertion failed: {str(e)}")
 
-                try:
-                    self.tickets_collection.insert_one(ticket_record)
-                except Exception as e:
-                    logger.error(f"Failed to insert ticket record for tickets {ado_ticket_id}/{servicenow_sys_id}: {str(e)}")
-                    raise ValueError(f"Ticket insertion failed: {str(e)}")
+                # Send ticket to Milvus for non-general_it_request intents
+                if intent != "general_it_request":
+                    ticket_record = self.tickets_collection.find_one({"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id})
+                    await self.send_to_milvus(ticket_record)
 
                 if intent != "general_it_request":
                     updated_ticket = self.tickets_collection.find_one({"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id})
@@ -1693,21 +2139,56 @@ class SKAgent:
                         logger.error(f"Failed to update tickets {ado_ticket_id}/{servicenow_sys_id}: {str(e)}")
                         raise ValueError(f"Ticket update failed: {str(e)}")
 
-                # Send email reply with updates from both systems
-                ado_updates_result = await self.kernel.invoke(
-                    self.kernel.plugins["ado"]["get_ticket_updates"],
-                    ticket_id=ado_ticket_id
-                )
-                servicenow_updates_result = await self.kernel.invoke(
-                    self.kernel.plugins["servicenow"]["get_ticket_updates"],
-                    ticket_id=servicenow_sys_id
-                )
-                ado_updates = ado_updates_result.value if ado_updates_result else []
-                servicenow_updates = servicenow_updates_result.value if servicenow_updates_result else []
-                updates = ado_updates + servicenow_updates
-                update_result = await self.analyze_ticket_update(ado_ticket_id, updates, attachments)
-                email_response = update_result["email_response"]
-                remediation = update_result["remediation"]
+                if servicenow_sys_id:
+                    try:
+                        servicenow_updates_result = await self.kernel.invoke(
+                            self.kernel.plugins["servicenow"]["get_ticket_updates"],
+                            ticket_id=servicenow_sys_id
+                        )
+                        servicenow_updates = servicenow_updates_result.value if servicenow_updates_result else []
+                    except Exception as e:
+                        logger.error(f"Failed to fetch ServiceNow updates for sys_id={servicenow_sys_id}: {str(e)}")
+                        servicenow_updates = []
+                        await broadcast({
+                            "type": "error",
+                            "email_id": email_id,
+                            "message": f"Failed to fetch ServiceNow updates: {str(e)}",
+                            "thread_id": thread_id
+                        })
+                else:
+                    logger.warning(f"No ServiceNow sys_id provided for email ID={email_id}")
+                    servicenow_updates = []
+                    await broadcast({
+                        "type": "error",
+                        "email_id": email_id,
+                        "message": "No ServiceNow sys_id available for update fetching",
+                        "thread_id": thread_id
+                    })
+
+                # Analyze ticket updates
+                try:
+                    update_result = await self.analyze_ticket_update(servicenow_sys_id, servicenow_updates, attachments)
+                    email_response = update_result.get("email_response", "No updates available.")
+                    existing_remediation = update_result.get("remediation", "")
+                except Exception as e:
+                    logger.error(f"Error analyzing ticket update for sys_id={servicenow_sys_id}: {str(e)}")
+                    email_response = "Unable to process ticket updates at this time."
+                    existing_remediation = ""
+                    await broadcast({
+                        "type": "error",
+                        "email_id": email_id,
+                        "message": f"Failed to analyze ticket updates: {str(e)}",
+                        "thread_id": thread_id
+                    })
+
+                # Combine remediation from Milvus with existing remediation
+                combined_remediation = existing_remediation
+                if remediation:
+                    combined_remediation = (
+                        f"{existing_remediation}\n\n**While we work on resolving your issue, you can try these remediation steps retrieved from the knowledge base articles:**\n\n{remediation}"
+                        if existing_remediation else
+                        f"**While we work on resolving your issue, you can try these remediation steps retrieved from the knowledge base articles:**\n\n{remediation}"
+                    )
 
                 if intent == "git_and_aws_intent" or intent == "aws_ec2_launch_instance":
                     ticket_record = self.tickets_collection.find_one({"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id})
@@ -1719,15 +2200,21 @@ class SKAgent:
                         logs = ec2_actions[-1]["logs"]
                         email_response += f"\n\nEC2 Execution Logs:\n{logs}"
 
+                # Combine email_response and remediation, add greeting and signature
+                combined_body = f"Dear {sender_username},\n\n{email_response}"
+                if combined_remediation:
+                    combined_body += f"\n\n{combined_remediation}"
+                combined_body += "\n\nBest regards,\nIT Support Agent"
+
                 reply_result = await self.kernel.invoke(
                     self.kernel.plugins["email_sender"]["send_reply"],
                     to=sender,
                     subject=subject,
-                    body=email_response,
+                    body=combined_body,
                     thread_id=thread_id,
                     message_id=email_id,
                     attachments=attachments,
-                    remediation=remediation
+                    remediation=""
                 )
                 reply = reply_result.value if reply_result else None
 
@@ -1736,7 +2223,7 @@ class SKAgent:
                         "email_id": reply.get("message_id", str(uuid.uuid4())),
                         "from": os.getenv('EMAIL_ADDRESS', 'IT Support <support@quadranttechnologies.com>'),
                         "subject": subject,
-                        "body": email_response,
+                        "body": combined_body,
                         "timestamp": datetime.now().isoformat(),
                         "attachments": []
                     }
@@ -1749,29 +2236,54 @@ class SKAgent:
                         logger.error(f"Failed to update email chain for tickets {ado_ticket_id}/{servicenow_sys_id}: {str(e)}")
                         raise ValueError(f"Email chain update failed: {str(e)}")
 
+                    # Update Milvus after email chain update
+                    updated_ticket = self.tickets_collection.find_one({"thread_id": thread_id})
+                    if updated_ticket:
+                        await self.send_to_milvus(updated_ticket)
+
                     await broadcast({
                         "type": "email_reply",
                         "email_id": email_id,
                         "thread_id": thread_id
                     })
 
-                if monitor_task and intent != "general_it_request":
-                    await self.stop_monitoring(details["instance_id"])
-                    await broadcast({
-                        "type": "monitoring_stopped",
-                        "email_id": email_id,
-                        "instance_id": details["instance_id"],
-                        "message": f"Stopped CloudWatch monitoring for instance {details['instance_id']}"
-                    })
+                    if monitor_task and intent != "general_it_request":
+                        await self.stop_monitoring(details["instance_id"])
+                        await broadcast({
+                            "type": "monitoring_stopped",
+                            "email_id": email_id,
+                            "instance_id": details["instance_id"],
+                            "message": f"Stopped CloudWatch monitoring for instance {details['instance_id']}",
+                            "thread_id": thread_id
+                        })
 
-                return {
-                    "status": "success",
-                    "ado_ticket_id": ado_ticket_id,
-                    "servicenow_sys_id": servicenow_sys_id,
-                    "intent": intent,
-                    "actions": completed_actions,
-                    "pending_actions": pending_actions
-                }
+                    return {
+                        "status": "success",
+                        "ado_ticket_id": ado_ticket_id,
+                        "servicenow_sys_id": servicenow_sys_id,
+                        "intent": intent,
+                        "actions": completed_actions,
+                        "pending_actions": pending_actions
+                    }
+
+            if monitor_task:
+                await self.stop_monitoring(details["instance_id"])
+                await broadcast({
+                    "type": "monitoring_stopped",
+                    "email_id": email_id,
+                    "instance_id": details["instance_id"],
+                    "message": f"Stopped CloudWatch monitoring for instance {details['instance_id']}",
+                    "thread_id": thread_id
+                })
+
+            return {
+                "status": "success",
+                "ado_ticket_id": ado_ticket_id,
+                "servicenow_sys_id": servicenow_sys_id,
+                "intent": intent,
+                "actions": completed_actions,
+                "pending_actions": pending_actions
+            }
 
         except Exception as e:
             logger.error(f"Error processing email ID={email_id}: {str(e)}")
@@ -1781,12 +2293,14 @@ class SKAgent:
                     "type": "monitoring_stopped",
                     "email_id": email_id,
                     "instance_id": details["instance_id"],
-                    "message": f"Stopped CloudWatch monitoring for instance {details['instance_id']}"
+                    "message": f"Stopped CloudWatch monitoring for instance {details['instance_id']}",
+                    "thread_id": thread_id
                 })
             await broadcast({
                 "type": "error",
                 "email_id": email_id,
-                "message": str(e)
+                "message": str(e),
+                "thread_id": thread_id
             })
             return {
                 "status": "error",
