@@ -13,6 +13,7 @@ import email.mime.base
 from email import encoders
 import time
 from collections import defaultdict
+import markdown
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -27,16 +28,16 @@ class EmailSenderPlugin:
         logger.info("Initialized Gmail send service")
 
     @kernel_function(
-        description="Send an email reply to a recipient with optional attachments and remediation.",
+        description="Send an email reply to a recipient with optional attachments and remediation, formatted with Markdown including tables.",
         name="send_reply"
     )
     async def send_reply(self, to: str, subject: str, body: str, thread_id: str, message_id: str, attachments: list = None, remediation: str = None) -> dict:
         """
-        Send an email reply.
+        Send an email reply with Markdown formatting.
         Args:
             to (str): Recipient email address.
             subject (str): Email subject.
-            body (str): Email body.
+            body (str): Email body in Markdown format.
             thread_id (str): Thread ID for reply.
             message_id (str): Message ID for In-Reply-To header.
             attachments (list): List of attachment metadata (filename, path, mimeType) (optional).
@@ -87,7 +88,7 @@ class EmailSenderClient:
             raise
 
     def send_reply(self, to, subject, body, thread_id, message_id, attachments=None, remediation=None):
-        """Send an email reply, skipping duplicates within a time window."""
+        """Send an email reply with Markdown formatting, skipping duplicates within a time window."""
         try:
             # Validate thread_id and message_id
             if not thread_id or len(thread_id) < 10:
@@ -107,7 +108,8 @@ class EmailSenderClient:
 
             logger.info(f"Preparing reply to {to} with thread_id={thread_id}, message_id={message_id}")
 
-            message = email.mime.multipart.MIMEMultipart()
+            # Create MIME message
+            message = email.mime.multipart.MIMEMultipart('alternative')
             message['to'] = to
             # Ensure subject starts with "Re:" (case-insensitive)
             if not subject.lower().startswith('re:'):
@@ -119,10 +121,36 @@ class EmailSenderClient:
 
             # Append remediation if provided
             if remediation:
-                body += f"\n\nWhile I get back to you, you can try these steps:\n{remediation}"
+                body += f"\n\n## Remediation Steps\n{remediation}"
 
-            # Add body
+            # Convert Markdown to HTML
+            html_body = markdown.markdown(body, extensions=['extra', 'tables'])
+
+            # Add enhanced CSS for better table and text formatting
+            styled_html = f"""
+            <html>
+            <head>
+                <style>
+                    body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; margin: 20px; }}
+                    h1 {{ font-size: 1.5em; color: #2c3e50; margin-bottom: 10px; }}
+                    h2 {{ font-size: 1.2em; color: #34495e; margin: 10px 0; }}
+                    p {{ margin: 10px 0; }}
+                    table {{ border-collapse: collapse; width: 100%; margin: 10px 0; }}
+                    th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+                    th {{ background-color: #f2f2f2; font-weight: bold; }}
+                    tr:nth-child(even) {{ background-color: #f9f9f9; }}
+                    strong {{ color: #2c3e50; }}
+                </style>
+            </head>
+            <body>
+                {html_body}
+            </body>
+            </html>
+            """
+
+            # Attach plain text and HTML versions
             message.attach(email.mime.text.MIMEText(body, 'plain'))
+            message.attach(email.mime.text.MIMEText(styled_html, 'html'))
 
             # Add attachments
             if attachments:
@@ -166,4 +194,4 @@ class EmailSenderClient:
 
         except Exception as e:
             logger.error(f"Error sending reply to {to}: {str(e)}")
-            raise  # Propagate the exception to ensure failure is reported correctly
+            raise

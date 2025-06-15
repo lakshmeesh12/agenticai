@@ -112,16 +112,6 @@ async def process_emails():
                     sender_email = email.get("from", "")
                     is_valid_domain = valid_domain in sender_email
                     
-                    # Removed redundant email_detected broadcast
-                    # Previously: 
-                    # await broadcast({
-                    #     "type": "email_detected",
-                    #     "subject": email['subject'],
-                    #     "sender": sender_email,
-                    #     "email_id": email_id,
-                    #     "is_valid_domain": is_valid_domain
-                    # })
-                    
                     if not is_valid_domain:
                         logger.warning(f"Unauthorized email from {sender_email}")
                         await broadcast({
@@ -254,6 +244,13 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                     },
                                     upsert=True
                                 )
+                                await broadcast({
+                                    "type": "email_reply",
+                                    "email_id": email_id,
+                                    "thread_id": thread_id,
+                                    "message": "Sent response indicating no existing ticket found for summary request",
+                                    "timestamp": datetime.now().isoformat()
+                                })
                             cleanup_temp_files(temp_files)
                             continue
 
@@ -298,6 +295,7 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                 "ado_ticket_id": existing_ticket["ado_ticket_id"],
                                 "servicenow_sys_id": existing_ticket["servicenow_sys_id"],
                                 "thread_id": thread_id,
+                                "message": f"Sent summary of ticket status for ADO ticket {existing_ticket['ado_ticket_id']}",
                                 "timestamp": datetime.now().isoformat()
                             })
                         cleanup_temp_files(temp_files)
@@ -417,13 +415,12 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                         comment=f"Processed {intent} for {github_username} on {repo_name}"
                                     )
                                 
-                                # Modified to include thread_id in ticket_updated broadcast
                                 await broadcast({
                                     "type": "ticket_updated",
                                     "email_id": email_id,
                                     "ado_ticket_id": ado_ticket_id,
                                     "servicenow_sys_id": servicenow_sys_id,
-                                    "thread_id": thread_id,  # Added thread_id
+                                    "thread_id": thread_id,
                                     "status": ado_status,
                                     "request_type": intent,
                                     "comment": f"Processed {intent} for {github_username} on {repo_name}"
@@ -462,13 +459,12 @@ To: {os.getenv('EMAIL_ADDRESS', 'Unknown')}
                                 
                                 tickets_collection.update_one({"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id}, update_operation)
                                 
-                                # Modified to include thread_id in ticket_updated broadcast
                                 await broadcast({
                                     "type": "ticket_updated",
                                     "email_id": email_id,
                                     "ado_ticket_id": ado_ticket_id,
                                     "servicenow_sys_id": servicenow_sys_id,
-                                    "thread_id": thread_id,  # Added thread_id
+                                    "thread_id": thread_id,
                                     "status": status,
                                     "request_type": intent,
                                     "comment": comment
@@ -593,6 +589,17 @@ async def process_tickets():
                                         for a in attachments
                                     ]
                                 }
+                                
+                                if email_status:
+                                    await broadcast({
+                                        "type": "email_reply",
+                                        "email_id": email_message_id,
+                                        "ado_ticket_id": ado_ticket_id,
+                                        "servicenow_sys_id": servicenow_sys_id,
+                                        "thread_id": thread_id,
+                                        "message": f"Sent update notification for ticket ADO={ado_ticket_id}/SN={servicenow_sys_id}: {update_result.get('summary', 'Ticket status updated')}",
+                                        "timestamp": datetime.now().isoformat()
+                                    })
                     
                     # Store ADO updates
                     for update in ado_new_updates:
@@ -637,13 +644,24 @@ async def process_tickets():
                             }
                         })
                     
+                    # Apply update operations
                     for operation in update_operations:
-                        tickets_collection.update_one(
-                            {"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id},
-                            operation,
-                            upsert=True
-                        )
+                        try:
+                            tickets_collection.update_one(
+                                {"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id},
+                                operation,
+                                upsert=True
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to apply update operation for ticket ADO={ado_ticket_id}/SN={servicenow_sys_id}: {str(e)}")
+                            await broadcast({
+                                "type": "error",
+                                "email_id": email_id,
+                                "message": f"Failed to update ticket: {str(e)}",
+                                "thread_id": thread_id
+                            })
                     
+                    # Update ticket_info
                     ticket_key = ado_ticket_id or servicenow_sys_id
                     ticket_info[ticket_key] = ticket_info.get(ticket_key, {})
                     if ado_new_updates:
@@ -657,6 +675,7 @@ async def process_tickets():
                         "email_id": email_message_id if email_status else ticket.get('email_id', str(uuid.uuid4()))
                     })
                     
+                    # Update Milvus
                     updated_ticket = tickets_collection.find_one({"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id})
                     if updated_ticket:
                         await agent.send_to_milvus(updated_ticket)
@@ -665,16 +684,6 @@ async def process_tickets():
                             {"$set": {"in_milvus": True}},
                             upsert=True
                         )
-                    
-                    if email_status:
-                        await broadcast({
-                            "type": "email_reply",
-                            "email_id": email_message_id,
-                            "ado_ticket_id": ado_ticket_id,
-                            "servicenow_sys_id": servicenow_sys_id,
-                            "thread_id": ticket.get('thread_id', str(uuid.uuid4())),
-                            "timestamp": datetime.now().isoformat()
-                        })
                 
                 elif not ticket.get("in_milvus", False):
                     await agent.send_to_milvus(ticket)
@@ -687,6 +696,12 @@ async def process_tickets():
             await asyncio.sleep(20)
         except Exception as e:
             logger.error(f"Error in ticket processing loop: {str(e)}")
+            await broadcast({
+                "type": "error",
+                "email_id": str(uuid.uuid4()),
+                "message": f"Ticket processing error: {str(e)}",
+                "thread_id": str(uuid.uuid4())
+            })
             await asyncio.sleep(20)
 
 @app.get("/run-agent")
@@ -759,28 +774,6 @@ async def run_agent():
 class AdminRequest(BaseModel):
     ticket_id: int
     request: str
-
-# @app.post("/send-request")
-# async def send_request(admin_request: AdminRequest):
-#     """Handle admin request for ticket summary or update."""
-#     try:
-#         kernel = Kernel()
-#         kernel.add_plugin(EmailReaderPlugin(), plugin_name="email_reader")
-#         kernel.add_plugin(EmailSenderPlugin(), plugin_name="email_sender")
-#         kernel.add_plugin(ADOPlugin(), plugin_name="ado")
-#         kernel.add_plugin(GitPlugin(), plugin_name="git")
-#         agent = SKAgent(kernel, tickets_collection)  # Pass tickets_collection
-
-#         result = await agent.process_admin_request(admin_request.ticket_id, admin_request.request)
-#         return {
-#             "status": "success",
-#             "summary_intent": result["summary_intent"],
-#             "response": result["email_response"]
-#         }
-#     except Exception as e:
-#         logger.error(f"Error in /send-request endpoint: {str(e)}")
-#         raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
-
 
 class AdminRequest(BaseModel):
     # Change ticket_id to Optional[str] to match frontend and allow missing field

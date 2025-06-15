@@ -1307,7 +1307,11 @@ class SKAgent:
                     await broadcast({
                         "type": "email_reply",
                         "email_id": email_id,
-                        "thread_id": thread_id
+                        "thread_id": thread_id,
+                        "ado_ticket_id": ticket_record["ado_ticket_id"],
+                        "servicenow_sys_id": ticket_record["servicenow_sys_id"],
+                        "message": f"Sent summary of ticket status for ADO ticket {ticket_record['ado_ticket_id']}",
+                        "timestamp": datetime.now().isoformat()
                     })
 
                 if monitor_task:
@@ -1536,7 +1540,11 @@ class SKAgent:
                     await broadcast({
                         "type": "email_reply",
                         "email_id": email_id,
-                        "thread_id": thread_id
+                        "thread_id": thread_id,
+                        "ado_ticket_id": ado_ticket_id,
+                        "servicenow_sys_id": servicenow_sys_id,
+                        "message": f"Sent response for {intent.replace('_', ' ')} request: {action_details['status']} - {action_details['message']}",
+                        "timestamp": datetime.now().isoformat()
                     })
 
                 # Update Milvus with the latest ticket data
@@ -1743,7 +1751,11 @@ class SKAgent:
                     await broadcast({
                         "type": "email_reply",
                         "email_id": email_id,
-                        "thread_id": thread_id
+                        "thread_id": thread_id,
+                        "ado_ticket_id": ado_ticket_id,
+                        "servicenow_sys_id": servicenow_sys_id,
+                        "message": f"Sent response for combined GitHub and AWS requests: processed {len(sub_intents)} sub-intents",
+                        "timestamp": datetime.now().isoformat()
                     })
 
                 # Update Milvus with the latest ticket data
@@ -2244,7 +2256,11 @@ class SKAgent:
                     await broadcast({
                         "type": "email_reply",
                         "email_id": email_id,
-                        "thread_id": thread_id
+                        "thread_id": thread_id,
+                        "ado_ticket_id": ado_ticket_id,
+                        "servicenow_sys_id": servicenow_sys_id,
+                        "message": f"Sent response for {intent.replace('_', ' ')} request: ticket created and processed",
+                        "timestamp": datetime.now().isoformat()
                     })
 
                     if monitor_task and intent != "general_it_request":
