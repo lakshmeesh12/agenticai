@@ -4,6 +4,7 @@ import { useApp } from "@/contexts/AppContext";
 import { TicketDetail } from "@/components/tickets/TicketDetail";
 import { Button } from "@/components/ui/button";
 import { ChevronLeft } from "lucide-react";
+import Navbar from "@/components/layout/Navbar";
 
 const TicketDetailPage = () => {
   const { id } = useParams<{ id: string }>();

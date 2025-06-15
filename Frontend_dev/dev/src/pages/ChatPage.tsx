@@ -1,5 +1,6 @@
 import { ChatInterface } from "@/components/chat/ChatInterface";
 import { useToast } from "@/components/ui/use-toast";
+import Navbar from "@/components/layout/Navbar";
 
 const ChatPage = () => {
   const { toast } = useToast();

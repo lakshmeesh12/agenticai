@@ -7,6 +7,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { useState, useEffect } from "react";
 import { getRequestTypes } from "@/lib/api";
 import { useToast } from "@/components/ui/use-toast";
+import Navbar from "@/components/layout/Navbar";
 
 const TicketsPage = () => {
   const navigate = useNavigate();

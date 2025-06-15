@@ -1,33 +1,13 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useApp } from "@/contexts/AppContext";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
-
-// Utility function to format time distance
-const formatDistanceToNow = (date: Date, options?: { addSuffix?: boolean }) => {
-  const now = new Date();
-  const diffInMs = now.getTime() - date.getTime();
-  const diffInMinutes = Math.floor(diffInMs / (1000 * 60));
-  const diffInHours = Math.floor(diffInMs / (1000 * 60 * 60));
-  const diffInDays = Math.floor(diffInMs / (1000 * 60 * 60 * 24));
-
-  let result = '';
-  if (diffInMinutes < 1) {
-    result = 'just now';
-  } else if (diffInMinutes < 60) {
-    result = `${diffInMinutes} minute${diffInMinutes > 1 ? 's' : ''}`;
-  } else if (diffInHours < 24) {
-    result = `${diffInHours} hour${diffInHours > 1 ? 's' : ''}`;
-  } else {
-    result = `${diffInDays} day${diffInDays > 1 ? 's' : ''}`;
-  }
-
-  return options?.addSuffix ? `${result} ago` : result;
-};
-
 import { Button } from "@/components/ui/button";
 import { Inbox, Send, Trash2, Archive, Star, Clock, Activity, AlertCircle, Loader2 } from "lucide-react";
+import Navbar from "@/components/layout/Navbar"; // MODIFICATION: Imported the Navbar component
+
+// --- All utility functions and interfaces remain unchanged ---
 
 interface BroadcastMessage {
   id: string;
@@ -62,6 +42,28 @@ interface Cycle {
   lastCompletionTimestamp?: string;
 }
 
+const formatDistanceToNow = (date: Date, options?: { addSuffix?: boolean }) => {
+  const now = new Date();
+  const diffInMs = now.getTime() - date.getTime();
+  const diffInMinutes = Math.floor(diffInMs / (1000 * 60));
+  const diffInHours = Math.floor(diffInMs / (1000 * 60 * 60));
+  const diffInDays = Math.floor(diffInMs / (1000 * 60 * 60 * 24));
+
+  let result = '';
+  if (diffInMinutes < 1) {
+    result = 'just now';
+  } else if (diffInMinutes < 60) {
+    result = `${diffInMinutes} minute${diffInMinutes > 1 ? 's' : ''}`;
+  } else if (diffInHours < 24) {
+    result = `${diffInHours} hour${diffInHours > 1 ? 's' : ''}`;
+  } else {
+    result = `${diffInDays} day${diffInDays > 1 ? 's' : ''}`;
+  }
+
+  return options?.addSuffix ? `${result} ago` : result;
+};
+
+
 const messageTypeLabels: Record<string, string> = {
   email_detected: "Email Detected",
   intent_analyzed: "Intent Analyzed",
@@ -79,9 +81,9 @@ const messageTypeLabels: Record<string, string> = {
 };
 
 const messageTypeColors: Record<string, string> = {
-  email_detected: "bg-yellow-100 text-yellow-800",
+  email_detected: "bg-amber-100 text-amber-800",
   intent_analyzed: "bg-blue-100 text-blue-800",
-  ticket_created: "bg-green-100 text-green-800",
+  ticket_created: "bg-emerald-100 text-emerald-800",
   action_performed: "bg-teal-100 text-teal-800",
   email_reply: "bg-purple-100 text-purple-800",
   session: "bg-gray-100 text-gray-800",
@@ -89,7 +91,7 @@ const messageTypeColors: Record<string, string> = {
   spam_alert: "bg-red-100 text-red-800",
   monitoring_started: "bg-indigo-100 text-indigo-800",
   monitoring_stopped: "bg-gray-100 text-gray-800",
-  permission_fixed: "bg-green-100 text-green-800",
+  permission_fixed: "bg-emerald-100 text-emerald-800",
   script_execution_failed: "bg-red-100 text-red-800",
   ticket_updated: "bg-blue-100 text-blue-800",
 };
@@ -106,11 +108,10 @@ const getMessageTypeLogo = (message: BroadcastMessage): string | null => {
     case "email_reply":
       return "https://1000logos.net/wp-content/uploads/2018/05/Gmail-Logo-500x281.jpg";
     case "action_performed":
-      // Check if it's access-related action
       const messageText = message.message || "";
-      if (messageText.includes("Pull access granted") || 
-          messageText.includes("Push access granted") || 
-          messageText.includes("Access revoked")) {
+      if (messageText.includes("Pull access granted") ||
+        messageText.includes("Push access granted") ||
+        messageText.includes("Access revoked")) {
         return "https://th.bing.com/th/id/OIP.Vn8Aa5ypdPND2xyceZIAdAHaHS?rs=1&pid=ImgDetMain";
       }
       return null;
@@ -122,27 +123,23 @@ const getMessageTypeLogo = (message: BroadcastMessage): string | null => {
 const getMessageDetails = (message: BroadcastMessage): string => {
   switch (message.type) {
     case "email_detected":
-      return `Subject: ${message.subject || "No Subject"}, From: ${message.sender || "Unknown"}${
-        message.is_valid_domain === false ? ' - <span class="text-red-600">UNAUTHORIZED DOMAIN</span>' : ""
-      }`;
+      return `Subject: ${message.subject || "No Subject"}, From: ${message.sender || "Unknown"}${message.is_valid_domain === false ? ' - <span class="text-red-600 font-medium">UNAUTHORIZED DOMAIN</span>' : ""
+        }`;
     case "intent_analyzed":
-      return `Intent: ${message.intent || "Unknown"}${
-        message.pending_actions !== undefined ? `, Pending Actions: ${message.pending_actions ? "Yes" : "No"}` : ""
-      }`;
+      return `Intent: ${message.intent || "Unknown"}${message.pending_actions !== undefined ? `, Pending Actions: ${message.pending_actions ? "Yes" : "No"}` : ""
+        }`;
     case "ticket_created":
       return [
         message.ado_ticket_id &&
-          `ADO Ticket ID: ${message.ado_ticket_id}${
-            message.ado_url
-              ? `, <a href="${message.ado_url}" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:underline">View in ADO</a>`
-              : ""
-          }`,
+        `ADO Ticket ID: ${message.ado_ticket_id}${message.ado_url
+          ? `, <a href="${message.ado_url}" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:underline">View in ADO</a>`
+          : ""
+        }`,
         message.servicenow_sys_id &&
-          `ServiceNow ID: ${message.servicenow_sys_id}${
-            message.servicenow_url
-              ? `, <a href="${message.servicenow_url}" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:underline">View in ServiceNow</a>`
-              : ""
-          }`,
+        `ServiceNow ID: ${message.servicenow_sys_id}${message.servicenow_url
+          ? `, <a href="${message.servicenow_url}" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:underline">View in ServiceNow</a>`
+          : ""
+        }`,
         message.intent && `Intent: ${message.intent}`,
       ]
         .filter(Boolean)
@@ -199,7 +196,8 @@ const getMessageDetails = (message: BroadcastMessage): string => {
         .filter(Boolean)
         .join("; ");
     case "email_reply":
-      return `Thread ID: ${message.thread_id || "N/A"}, Email ID: ${message.email_id || "N/A"}`;
+      // MODIFICATION: Display only the message field
+      return message.message || "No reply message available";
     case "session":
       return message.status ? `Status: ${message.status}` : "No status available";
     case "error":
@@ -224,8 +222,8 @@ const getCycleStatus = (cycle: Cycle): { status: string; color: string; icon: Re
   if (cycle.isCompleted) {
     return {
       status: "Completed",
-      color: "text-green-600",
-      icon: <div className="w-2 h-2 bg-green-500 rounded-full" />
+      color: "text-emerald-600",
+      icon: <div className="w-2 h-2 bg-emerald-500 rounded-full" />
     };
   } else if (cycle.isActive) {
     return {
@@ -236,8 +234,8 @@ const getCycleStatus = (cycle: Cycle): { status: string; color: string; icon: Re
   } else {
     return {
       status: "Pending",
-      color: "text-orange-600",
-      icon: <div className="w-2 h-2 bg-orange-500 rounded-full" />
+      color: "text-amber-600",
+      icon: <div className="w-2 h-2 bg-amber-500 rounded-full" />
     };
   }
 };
@@ -245,21 +243,79 @@ const getCycleStatus = (cycle: Cycle): { status: string; color: string; icon: Re
 const getCyclePreview = (cycle: Cycle): string => {
   const latestMessage = cycle.messages[cycle.messages.length - 1];
   if (!latestMessage) return "No details available";
-  
+
   const details = getMessageDetails(latestMessage).replace(/<[^>]*>/g, '');
   return details.length > 60 ? `${details.substring(0, 60)}...` : details;
 };
+
 
 export const RequestsTracker = () => {
   const { broadcastMessages } = useApp();
   const [cycles, setCycles] = useState<Cycle[]>([]);
   const [selectedCycle, setSelectedCycle] = useState<Cycle | null>(null);
   const [allMessages, setAllMessages] = useState<BroadcastMessage[]>([]);
+  const [sidebarWidth, setSidebarWidth] = useState(350);
+  const isResizing = useRef(false);
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    isResizing.current = true;
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+  };
+
+  const handleMouseMove = (e: MouseEvent) => {
+    if (isResizing.current) {
+      const newWidth = e.clientX;
+      if (newWidth >= 280 && newWidth <= 800) {
+        setSidebarWidth(newWidth);
+      }
+    }
+  };
+
+  const handleMouseUp = () => {
+    isResizing.current = false;
+    document.removeEventListener('mousemove', handleMouseMove);
+    document.removeEventListener('mouseup', handleMouseUp);
+  };
 
   useEffect(() => {
-    console.log('Broadcast messages received:', broadcastMessages);
+    const storedMessages = localStorage.getItem('activityMessages');
+    if (storedMessages) {
+      try {
+        const parsedMessages = JSON.parse(storedMessages);
+        setAllMessages(parsedMessages);
+      } catch (error) {
+        console.error('Error parsing stored messages:', error);
+      }
+    }
+  }, []);
 
-    // Add new messages to allMessages
+  useEffect(() => {
+    if (allMessages.length > 0) {
+      localStorage.setItem('activityMessages', JSON.stringify(allMessages));
+    }
+  }, [allMessages]);
+
+  const handleDeleteCycle = (cycleKey: string) => {
+    setCycles((prevCycles) => {
+      const updatedCycles = prevCycles.filter(
+        (cycle) => (cycle.thread_id || cycle.email_id) !== cycleKey
+      );
+      setAllMessages((prevMessages) => {
+        const updatedMessages = prevMessages.filter(
+          (msg) => (msg.thread_id || msg.email_id) !== cycleKey
+        );
+        localStorage.setItem('activityMessages', JSON.stringify(updatedMessages));
+        return updatedMessages;
+      });
+      if (selectedCycle && (selectedCycle.thread_id || selectedCycle.email_id) === cycleKey) {
+        setSelectedCycle(null);
+      }
+      return updatedCycles;
+    });
+  };
+
+  useEffect(() => {
     setAllMessages((prev) => {
       const newMessages = broadcastMessages.filter(
         (msg) => !prev.some((existing) => existing.id === msg.id)
@@ -267,7 +323,6 @@ export const RequestsTracker = () => {
       return [...prev, ...newMessages];
     });
 
-    // Process all messages into cycles
     const combinedMessages = [...allMessages, ...broadcastMessages].reduce((acc, msg) => {
       if (!acc.find((m) => m.id === msg.id)) {
         acc.push(msg);
@@ -282,7 +337,6 @@ export const RequestsTracker = () => {
       let cycleKey: string;
       let cycleThreadId: string | undefined;
 
-      // Determine which cycle this message belongs to
       if (msg.thread_id && threadToCycleMap[msg.thread_id]) {
         cycleKey = threadToCycleMap[msg.thread_id];
       } else if (msg.thread_id) {
@@ -292,12 +346,9 @@ export const RequestsTracker = () => {
       } else if (msg.email_id) {
         cycleKey = msg.email_id;
       } else {
-        // Messages without email_id or thread_id are treated as system messages
-        // Create a cycle for them based on message type or timestamp
         cycleKey = `system-${msg.type}-${msg.timestamp}`;
       }
 
-      // Create cycle if it doesn't exist
       if (!groupedByThread[cycleKey]) {
         groupedByThread[cycleKey] = {
           email_id: msg.email_id || cycleKey,
@@ -311,37 +362,30 @@ export const RequestsTracker = () => {
         };
       }
 
-      // Add message to cycle if not already present
       if (!groupedByThread[cycleKey].messages.some((existing) => existing.id === msg.id)) {
         groupedByThread[cycleKey].messages.push(msg);
       }
 
-      // Update cycle metadata
       groupedByThread[cycleKey].lastTimestamp =
         msg.timestamp > groupedByThread[cycleKey].lastTimestamp ? msg.timestamp : groupedByThread[cycleKey].lastTimestamp;
       groupedByThread[cycleKey].subject = groupedByThread[cycleKey].subject || msg.subject;
       groupedByThread[cycleKey].sender = groupedByThread[cycleKey].sender || msg.sender;
 
-      // Update thread mapping
       if (msg.thread_id && msg.email_id && !threadToCycleMap[msg.thread_id]) {
         threadToCycleMap[msg.thread_id] = cycleKey;
       }
     });
 
-    // Determine cycle status with improved logic
     const processedCycles = Object.values(groupedByThread).map((cycle) => {
-      // Sort messages by timestamp
       cycle.messages.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
 
-      // Find completion indicators
-      const completionMessages = cycle.messages.filter(msg => 
-        msg.type === "email_reply" || 
-        (msg.type === "action_performed" && 
-         getMessageDetails(msg).toLowerCase().includes("access revoked")) ||
+      const completionMessages = cycle.messages.filter(msg =>
+        msg.type === "email_reply" ||
+        (msg.type === "action_performed" &&
+          getMessageDetails(msg).toLowerCase().includes("access revoked")) ||
         msg.type === "error"
       );
 
-      // Find the latest completion message timestamp
       let lastCompletionTimestamp: string | undefined;
       if (completionMessages.length > 0) {
         lastCompletionTimestamp = completionMessages
@@ -350,107 +394,115 @@ export const RequestsTracker = () => {
         cycle.lastCompletionTimestamp = lastCompletionTimestamp;
       }
 
-      // Check if there are new messages after the last completion
-      const hasNewMessagesAfterCompletion = lastCompletionTimestamp ? 
-        cycle.messages.some(msg => new Date(msg.timestamp) > new Date(lastCompletionTimestamp!)) : 
+      const hasNewMessagesAfterCompletion = lastCompletionTimestamp ?
+        cycle.messages.some(msg => new Date(msg.timestamp) > new Date(lastCompletionTimestamp!)) :
         false;
 
-      // Determine if cycle is completed
       const hasCompletionIndicator = completionMessages.length > 0;
       cycle.isCompleted = hasCompletionIndicator && !hasNewMessagesAfterCompletion;
-      
-      // Determine if cycle is currently active
+
       const lastActivityTime = new Date(cycle.lastTimestamp).getTime();
       const now = new Date().getTime();
       const timeDiffMinutes = (now - lastActivityTime) / (1000 * 60);
-      
-      // A cycle is active if:
-      // 1. It's not completed, OR
-      // 2. It was completed but has new messages after completion, AND
-      // 3. Last activity was within 30 minutes
+
       cycle.isActive = (!cycle.isCompleted || hasNewMessagesAfterCompletion) && timeDiffMinutes < 30;
 
       return cycle;
     });
 
-    // Sort cycles by timestamp (most recent first)
-    const sortedCycles = processedCycles.sort((a, b) => 
+    const sortedCycles = processedCycles.sort((a, b) =>
       new Date(b.lastTimestamp).getTime() - new Date(a.lastTimestamp).getTime()
     );
 
     setCycles(sortedCycles);
 
-    // Update selected cycle if it exists in the new cycles
     if (selectedCycle) {
       const updatedSelectedCycle = sortedCycles.find(
-        cycle => cycle.email_id === selectedCycle.email_id || 
-        (cycle.thread_id && cycle.thread_id === selectedCycle.thread_id)
+        cycle => cycle.email_id === selectedCycle.email_id ||
+          (cycle.thread_id && cycle.thread_id === selectedCycle.thread_id)
       );
       if (updatedSelectedCycle) {
         setSelectedCycle(updatedSelectedCycle);
       }
     }
+  }, [broadcastMessages, allMessages]);
 
-    console.log('Processed cycles:', sortedCycles);
-  }, [broadcastMessages, allMessages, selectedCycle]);
 
   return (
-    <div className="flex h-screen bg-gray-50">
-      {/* Main Content Area */}
-      <div className="flex-1 flex">
-        {/* Recent Activity List Pane (Cycle-based) */}
-        <div className="w-80 bg-white border-r border-gray-200 flex flex-col">
-          <div className="p-4 border-b border-gray-200">
+    // MODIFICATION: Added a root fragment and a flex container to hold the Navbar and the main content.
+    <div className="flex flex-col h-screen bg-white">
+      <Navbar />
+      <div className="flex flex-1 overflow-hidden">
+        {/* Recent Activity Pane */}
+        <div
+          className="bg-slate-50 border-r border-slate-200 flex flex-col shadow-lg"
+          style={{ width: `${sidebarWidth}px`, minWidth: '280px', maxWidth: '800px' }}
+        >
+          <div className="p-4 border-b border-slate-200 bg-slate-100">
             <div className="flex items-center justify-between">
-              <h2 className="text-lg font-semibold text-gray-800">Recent Activity</h2>
-              <Activity size={20} className="text-gray-500" />
+              <h2 className="text-xl font-semibold text-gray-900 flex items-center gap-2">
+                <Activity size={20} className="text-blue-600" />
+                Recent Activity
+              </h2>
             </div>
-            <p className="text-xs text-gray-500 mt-1">
-              {cycles.length} cycle{cycles.length !== 1 ? 's' : ''}
+            <p className="text-sm text-gray-500 mt-1">
+              {cycles.length} active cycle{cycles.length !== 1 ? 's' : ''}
             </p>
           </div>
           <ScrollArea className="flex-1">
             {cycles.length === 0 ? (
-              <div className="p-4 text-center text-gray-500">
-                <AlertCircle size={48} className="mx-auto mb-2 text-gray-300" />
-                <p className="text-sm">No recent activity</p>
+              <div className="p-6 text-center text-gray-500">
+                <AlertCircle size={48} className="mx-auto mb-3 text-gray-300" />
+                <p className="text-sm font-medium">No recent activity</p>
               </div>
             ) : (
-              <div className="divide-y divide-gray-100">
+              <div className="divide-y divide-slate-200">
                 {cycles.map((cycle) => {
                   const status = getCycleStatus(cycle);
+                  const cycleKey = cycle.thread_id || cycle.email_id;
                   return (
                     <div
-                      key={cycle.thread_id || cycle.email_id}
-                      className={`p-4 cursor-pointer transition-colors hover:bg-gray-50 ${
-                        selectedCycle?.email_id === cycle.email_id ? 'bg-blue-50 border-l-4 border-blue-500' : ''
-                      } ${cycle.isActive ? 'bg-blue-25' : ''}`}
+                      key={cycleKey}
+                      className={`p-4 flex justify-between items-start transition-all duration-200 hover:bg-blue-50 cursor-pointer ${selectedCycle?.email_id === cycle.email_id ? 'bg-blue-100 border-l-4 border-blue-600' : 'border-l-4 border-transparent'
+                        } ${cycle.isActive ? 'bg-blue-50/50' : ''}`}
                       onClick={() => setSelectedCycle(cycle)}
                     >
-                      <div className="flex justify-between items-start mb-1">
-                        <h3 className="text-sm font-medium text-gray-900 truncate flex-1 mr-2">
-                          {cycle.subject || `Request ${cycle.thread_id || cycle.email_id}`}
-                        </h3>
-                        <span className="text-xs text-gray-500 flex-shrink-0">
-                          {formatDistanceToNow(new Date(cycle.lastTimestamp), { addSuffix: true })}
-                        </span>
-                      </div>
-                      
-                      <div className="flex items-center justify-between mb-2">
-                        <p className="text-xs text-gray-600">
-                          {cycle.sender || 'System'} • {cycle.messages.length} message{cycle.messages.length !== 1 ? 's' : ''}
-                        </p>
-                        <div className="flex items-center gap-1">
-                          {status.icon}
-                          <span className={`text-xs ${status.color}`}>
-                            {status.status}
+                      <div className="flex-1 overflow-hidden pr-2">
+                        <div className="flex justify-between items-start mb-1">
+                          <h3 className="text-sm font-semibold text-gray-900 truncate flex-1 mr-2">
+                            {cycle.subject || `Request ${cycleKey}`}
+                          </h3>
+                          <span className="text-xs text-gray-500 flex-shrink-0">
+                            {formatDistanceToNow(new Date(cycle.lastTimestamp), { addSuffix: true })}
                           </span>
                         </div>
+                        <div className="flex items-center justify-between mb-2">
+                          <p className="text-xs text-gray-600 truncate">
+                            {cycle.sender || 'System'} • {cycle.messages.length} event{cycle.messages.length !== 1 ? 's' : ''}
+                          </p>
+                          <div className="flex items-center gap-1.5">
+                            {status.icon}
+                            <span className={`text-xs font-medium ${status.color}`}>
+                              {status.status}
+                            </span>
+                          </div>
+                        </div>
+                        <p className="text-xs text-gray-500 truncate">
+                          {getCyclePreview(cycle)}
+                        </p>
                       </div>
-                      
-                      <p className="text-xs text-gray-500 truncate">
-                        {getCyclePreview(cycle)}
-                      </p>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDeleteCycle(cycleKey);
+                        }}
+                        className="text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-full w-8 h-8 flex-shrink-0"
+                        title="Delete activity"
+                      >
+                        <Trash2 size={16} />
+                      </Button>
                     </div>
                   );
                 })}
@@ -459,22 +511,40 @@ export const RequestsTracker = () => {
           </ScrollArea>
         </div>
 
+        {/* Resize Handle */}
+        <div
+          className="w-1.5 bg-slate-200 hover:bg-blue-500 cursor-col-resize transition-colors duration-200"
+          onMouseDown={handleMouseDown}
+        />
+
         {/* Agent Activity Log Detail Pane */}
-        <div className="flex-1 bg-white flex flex-col">
+        <div className="flex-1 bg-white flex flex-col shadow-inner">
           {selectedCycle ? (
             <>
-              <div className="p-4 border-b border-gray-200">
+              <div className="p-4 border-b border-gray-200 bg-gradient-to-r from-gray-50 to-white">
                 <div className="flex items-center justify-between mb-2">
-                  <h2 className="text-lg font-semibold text-gray-800">
+                  <h2 className="text-xl font-semibold text-gray-900 truncate">
                     {selectedCycle.subject || `Request ${selectedCycle.thread_id || selectedCycle.email_id}`}
                   </h2>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setSelectedCycle(null)}
-                  >
-                    Close
-                  </Button>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleDeleteCycle(selectedCycle.thread_id || selectedCycle.email_id)}
+                      className="text-red-500 hover:text-red-700 border-red-200 hover:bg-red-50"
+                    >
+                      <Trash2 size={16} className="mr-2" />
+                      Delete
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setSelectedCycle(null)}
+                      className="text-gray-600 hover:text-gray-800 border-gray-200 hover:bg-gray-50"
+                    >
+                      Close
+                    </Button>
+                  </div>
                 </div>
                 <div className="flex items-center justify-between">
                   <p className="text-sm text-gray-600">
@@ -482,7 +552,7 @@ export const RequestsTracker = () => {
                   </p>
                   <div className="flex items-center gap-2">
                     {getCycleStatus(selectedCycle).icon}
-                    <span className={`text-sm ${getCycleStatus(selectedCycle).color}`}>
+                    <span className={`text-sm font-medium ${getCycleStatus(selectedCycle).color}`}>
                       {getCycleStatus(selectedCycle).status}
                     </span>
                   </div>
@@ -493,48 +563,52 @@ export const RequestsTracker = () => {
                   {selectedCycle.messages.map((message, index) => {
                     const logo = getMessageTypeLogo(message);
                     return (
-                      <div key={message.id} className={`border-l-4 pl-4 py-2 ${
-                        index === selectedCycle.messages.length - 1 && selectedCycle.isActive
-                          ? 'border-blue-400 bg-blue-50' 
-                          : 'border-gray-200'
-                      }`}>
+                      <div
+                        key={message.id}
+                        className={`border-l-4 pl-4 py-3 rounded-r-lg transition-all duration-200 ${index === selectedCycle.messages.length - 1 && selectedCycle.isActive
+                            ? 'border-blue-500 bg-blue-50/50'
+                            : 'border-gray-200 hover:bg-gray-50/50'
+                          }`}
+                      >
                         <div className="flex items-center gap-2 mb-2">
                           {logo && (
                             <img
                               src={logo}
                               alt={`${messageTypeLabels[message.type]} logo`}
-                              className="h-6 w-6 object-contain"
+                              className="h-5 w-5 object-contain rounded"
                             />
                           )}
-                          <Badge className={messageTypeColors[message.type] || "bg-gray-100 text-gray-800"}>
+                          <Badge
+                            className={`${messageTypeColors[message.type] || "bg-gray-100 text-gray-800"
+                              } font-medium px-2 py-1 rounded-full`}
+                          >
                             {messageTypeLabels[message.type] || message.type}
                           </Badge>
-                          <span className="text-sm text-gray-500">
+                          <span className="text-xs text-gray-500">
                             {formatDistanceToNow(new Date(message.timestamp), { addSuffix: true })}
                           </span>
                           {index === selectedCycle.messages.length - 1 && selectedCycle.isActive && (
-                            <Badge variant="outline" className="text-blue-600 border-blue-300">
+                            <Badge variant="outline" className="text-blue-600 border-blue-300 font-medium">
                               Latest
                             </Badge>
                           )}
                         </div>
                         <div
-                          className="text-sm text-gray-700"
+                          className="text-sm text-gray-700 leading-relaxed"
                           dangerouslySetInnerHTML={{ __html: getMessageDetails(message) }}
                         />
                       </div>
                     );
                   })}
-                  
                   {selectedCycle.isActive && (
-                    <div className="border-l-4 border-blue-400 pl-4 py-2 bg-blue-25">
+                    <div className="border-l-4 border-blue-500 pl-4 py-3 bg-blue-50/50 rounded-r-lg">
                       <div className="flex items-center gap-2 mb-2">
                         <Loader2 size={16} className="animate-spin text-blue-500" />
-                        <Badge variant="outline" className="text-blue-600 border-blue-300">
+                        <Badge variant="outline" className="text-blue-600 border-blue-300 font-medium">
                           Processing...
                         </Badge>
                       </div>
-                      <p className="text-sm text-blue-700">
+                      <p className="text-sm text-blue-700 font-medium">
                         Activity is in progress. New updates will appear here automatically.
                       </p>
                     </div>
@@ -543,10 +617,10 @@ export const RequestsTracker = () => {
               </ScrollArea>
             </>
           ) : (
-            <div className="flex-1 flex items-center justify-center">
+            <div className="flex-1 flex items-center justify-center bg-gray-50">
               <div className="text-center py-12">
                 <Activity size={64} className="mx-auto mb-4 text-gray-300" />
-                <h3 className="text-lg font-medium text-gray-600 mb-2">Agent Activity Log</h3>
+                <h3 className="text-xl font-semibold text-gray-700 mb-2">Agent Activity Log</h3>
                 <p className="text-gray-500">Select a cycle from Recent Activity to view details</p>
                 <p className="text-sm text-gray-400 mt-1">
                   All messages in a cycle are grouped together like email threads
