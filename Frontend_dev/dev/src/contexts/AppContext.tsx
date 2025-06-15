@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { Ticket, MetricsData, BroadcastMessage } from '@/types';
-import { useToast } from "@/components/ui/use-toast";
+// import { useToast } from "@/components/ui/use-toast"; // REMOVE this import
 import { getTickets, getStatus, connectWebSocket, addWebSocketListener } from '../lib/api';
 
 interface CompletedCycle {
@@ -43,7 +43,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [currentNewTicket, setCurrentNewTicket] = useState<Ticket | null>(null);
   const [broadcastMessages, setBroadcastMessages] = useState<BroadcastMessage[]>([]);
   const [completedCycles, setCompletedCycles] = useState<CompletedCycle[]>([]);
-  const { toast } = useToast();
+  // const { toast } = useToast(); // REMOVE this line
 
   // Calculate metrics from tickets
   const calculateMetrics = (tickets: Ticket[]): MetricsData => {
@@ -119,11 +119,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setTickets(formattedTickets);
         setMetricsData(calculateMetrics(formattedTickets));
       } else {
-        toast({
-          title: "Error",
-          description: "Failed to fetch tickets",
-          variant: "destructive",
-        });
+        // toast({ // REMOVED
+        //   title: "Error",
+        //   description: "Failed to fetch tickets",
+        //   variant: "destructive",
+        // });
+        console.error("Failed to fetch tickets"); // Replaced with console log
       }
 
       if (statusResponse.status === 'success') {
@@ -131,11 +132,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
     } catch (error) {
       console.error('Error fetching data:', error);
-      toast({
-        title: "Error",
-        description: "Failed to fetch initial data",
-        variant: "destructive",
-      });
+      // toast({ // REMOVED
+      //   title: "Error",
+      //   description: "Failed to fetch initial data",
+      //   variant: "destructive",
+      // });
     }
   };
 
@@ -171,10 +172,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       if (data.type === 'session') {
         setIsAgentActive(data.status === 'started');
-        toast({
-          title: data.status === 'started' ? "Agent Started" : "Agent Stopped",
-          description: `Session ID: ${data.session_id || 'N/A'}`,
-        });
+        // toast({ // REMOVED
+        //   title: data.status === 'started' ? "Agent Started" : "Agent Stopped",
+        //   description: `Session ID: ${data.session_id || 'N/A'}`,
+        // });
+        console.log(`Agent ${data.status === 'started' ? 'Started' : 'Stopped'}. Session ID: ${data.session_id || 'N/A'}`); // Replaced with console log
       } else if (data.type === 'ticket') {
         setTickets(prev => {
           const newTicket = {
@@ -189,6 +191,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             comments: data.ticket.comments || [],
             priority: data.ticket.priority || 'medium',
             agentType: data.ticket.agentType || 'semi-autonomous',
+            pending_actions: data.ticket.pending_actions || false,
+            updates: data.ticket.updates || [],
+            email_chain: data.ticket.email_chain || [],
+            details: data.ticket.details || {},
           };
           const newTickets = [newTicket, ...prev.filter(t => t.ado_ticket_id !== newTicket.ado_ticket_id && t.servicenow_sys_id !== newTicket.servicenow_sys_id)];
           setMetricsData(calculateMetrics(newTickets));
@@ -196,15 +202,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         });
         setCurrentNewTicket(data.ticket);
         setShowNewTicketNotification(true);
-        toast({
-          title: "New Ticket Received",
-          description: `Ticket: ${data.ticket.subject || 'No Subject'}`,
-        });
+        // toast({ // REMOVED
+        //   title: "New Ticket Received",
+        //   description: `Ticket: ${data.ticket.subject || 'No Subject'}`,
+        // });
+        console.log(`New Ticket Received: ${data.ticket.subject || 'No Subject'}`); // Replaced with console log
       } else if (['email_detected', 'intent_analyzed', 'ticket_created', 'action_performed', 'email_reply', 'monitoring_started', 'monitoring_stopped', 'permission_fixed', 'script_execution_failed'].includes(data.type)) {
-        toast({
-          title: messageTypeLabels[data.type] || data.type,
-          description: `${data.subject || data.intent || data.message || 'Action processed'}`,
-        });
+        // toast({ // REMOVED
+        //   title: messageTypeLabels[data.type] || data.type,
+        //   description: `${data.subject || data.intent || data.message || 'Action processed'}`,
+        // });
+        console.log(`${messageTypeLabels[data.type] || data.type}: ${data.subject || data.intent || data.message || 'Action processed'}`); // Replaced with console log
       }
     });
 
@@ -212,59 +220,67 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       unsubscribe();
       ws.close();
     };
-  }, [toast]);
+  }, [
+    // toast // REMOVE this from dependency array
+  ]);
 
   const getTicketById = (id: string) => {
     return tickets.find(ticket => ticket.id === id || ticket.ado_ticket_id === id || ticket.servicenow_sys_id === id);
   };
 
   const updateTicketStatus = (id: string, status: Ticket['status']) => {
-    setTickets(prev => prev.map(ticket => {
-      if (ticket.id === id || ticket.ado_ticket_id === id || ticket.servicenow_sys_id === id) {
-        const updatedTicket = { ...ticket, status };
-        
-        const statusEvent: Event = {
-          id: `evt-status-${Date.now()}`,
-          timestamp: new Date().toISOString(),
-          description: `Ticket status changed to ${status}`,
-          type: status === 'completed' ? 'agent' : 'supervisor',
-        };
-        
-        const timestamps = { ...ticket.timestamps };
-        if (status === 'in-progress' && !timestamps.started) {
-          timestamps.started = new Date().toISOString();
-        } else if (status === 'completed' && !timestamps.completed) {
-          timestamps.completed = new Date().toISOString();
+    let updatedTickets: Ticket[] = []; // Temporary variable to hold the updated tickets
+
+    setTickets(prev => {
+      const newState = prev.map(ticket => {
+        if (ticket.id === id || ticket.ado_ticket_id === id || ticket.servicenow_sys_id === id) {
+          const statusEvent: Event = {
+            id: `evt-status-${Date.now()}`,
+            timestamp: new Date().toISOString(),
+            description: `Ticket status changed to ${status}`,
+            type: status === 'completed' ? 'agent' : 'supervisor',
+          };
+
+          const timestamps = { ...ticket.timestamps };
+          if (status === 'in-progress' && !timestamps.started) {
+            timestamps.started = new Date().toISOString();
+          } else if (status === 'completed' && !timestamps.completed) {
+            timestamps.completed = new Date().toISOString();
+          }
+
+          return {
+            ...ticket,
+            status,
+            timestamps,
+            events: [...(ticket.events || []), statusEvent],
+          };
         }
-        
-        return {
-          ...ticket,
-          status,
-          timestamps,
-          events: [...(ticket.events || []), statusEvent],
-        };
-      }
-      return ticket;
-    }));
-    
-    setMetricsData(calculateMetrics(tickets));
-    
-    if (status === 'completed' || status === 'failed') {
-      const ticket = tickets.find(t => t.id === id || t.ado_ticket_id === id || ticket.servicenow_sys_id === id);
-      toast({
-        title: `Ticket ${status === 'completed' ? 'Completed' : 'Failed'}`,
-        description: `${id}: ${ticket?.subject || 'No Subject'}`,
-        variant: status === 'completed' ? 'default' : 'destructive',
+        return ticket;
       });
+      updatedTickets = newState; // Capture the new state for metrics calculation
+      return newState;
+    });
+
+    // Calculate metrics based on the *updated* tickets array
+    setMetricsData(calculateMetrics(updatedTickets));
+
+    if (status === 'completed' || status === 'failed') {
+      const ticket = updatedTickets.find(t => t.id === id || t.ado_ticket_id === id || t.servicenow_sys_id === id);
+      // toast({ // REMOVED
+      //   title: `Ticket ${status === 'completed' ? 'Completed' : 'Failed'}`,
+      //   description: `${id}: ${ticket?.subject || 'No Subject'}`,
+      //   variant: status === 'completed' ? 'default' : 'destructive',
+      // });
+      console.log(`Ticket ${status === 'completed' ? 'Completed' : 'Failed'}: ${id}: ${ticket?.subject || 'No Subject'}`); // Replaced with console log
     }
   };
 
   return (
-    <AppContext.Provider 
-      value={{ 
-        tickets, 
-        metricsData, 
-        isAgentActive, 
+    <AppContext.Provider
+      value={{
+        tickets,
+        metricsData,
+        isAgentActive,
         setIsAgentActive,
         showNewTicketNotification,
         setShowNewTicketNotification,
