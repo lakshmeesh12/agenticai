@@ -1,7 +1,6 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
 import { Ticket, MetricsData, BroadcastMessage } from '@/types';
-// import { useToast } from "@/components/ui/use-toast"; // REMOVE this import
-import { getTickets, getStatus, connectWebSocket, addWebSocketListener } from '../lib/api';
+import { getTickets, getStatus } from '../lib/api';
 
 interface CompletedCycle {
   email_id: string;
@@ -25,6 +24,69 @@ interface AppContextProps {
 
 const AppContext = createContext<AppContextProps | undefined>(undefined);
 
+// WebSocket connection with reconnection logic
+const connectWebSocket = (onMessage: (data: any) => void) => {
+  let ws: WebSocket | null = null;
+  let reconnectAttempts = 0;
+  const maxReconnectAttempts = 5;
+  const baseReconnectDelay = 1000; // 1 second
+
+  const connect = () => {
+    ws = new WebSocket('ws://localhost:8000/ws');
+    console.log('WebSocket connecting...');
+
+    ws.onopen = () => {
+      console.log('WebSocket connected');
+      reconnectAttempts = 0; // Reset attempts on successful connection
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === 'ping') {
+          ws?.send('pong');
+          console.log('Sent pong response');
+        } else {
+          onMessage(data);
+        }
+      } catch (error) {
+        console.error('Error parsing WebSocket message:', error);
+      }
+    };
+
+    ws.onclose = (event) => {
+      console.log(`WebSocket closed with code ${event.code}, reason: ${event.reason || 'unknown'}`);
+      if (reconnectAttempts < maxReconnectAttempts) {
+        const delay = baseReconnectDelay * Math.pow(2, reconnectAttempts);
+        console.log(`Reconnecting in ${delay}ms... (Attempt ${reconnectAttempts + 1}/${maxReconnectAttempts})`);
+        setTimeout(() => {
+          reconnectAttempts++;
+          connect();
+        }, delay);
+      } else {
+        console.error('Max reconnect attempts reached. WebSocket connection failed.');
+      }
+    };
+
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+      ws?.close();
+    };
+  };
+
+  connect();
+
+  return {
+    close: () => {
+      if (ws) {
+        ws.onclose = null; // Prevent reconnection
+        ws.close();
+        console.log('WebSocket closed manually');
+      }
+    },
+  };
+};
+
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [metricsData, setMetricsData] = useState<MetricsData>({
@@ -43,9 +105,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [currentNewTicket, setCurrentNewTicket] = useState<Ticket | null>(null);
   const [broadcastMessages, setBroadcastMessages] = useState<BroadcastMessage[]>([]);
   const [completedCycles, setCompletedCycles] = useState<CompletedCycle[]>([]);
-  // const { toast } = useToast(); // REMOVE this line
+  const wsRef = useRef<ReturnType<typeof connectWebSocket> | null>(null);
 
-  // Calculate metrics from tickets
   const calculateMetrics = (tickets: Ticket[]): MetricsData => {
     const now = new Date();
     const oneWeekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
@@ -83,67 +144,55 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return metrics;
   };
 
-  // Fetch backend tickets and status
   useEffect(() => {
-  const fetchData = async () => {
-    try {
-      const [ticketsResponse, statusResponse] = await Promise.all([
-        getTickets(),
-        getStatus(),
-      ]);
+    const fetchData = async () => {
+      try {
+        const [ticketsResponse, statusResponse] = await Promise.all([
+          getTickets(),
+          getStatus(),
+        ]);
 
-      if (ticketsResponse.status === 'success' && ticketsResponse.tickets) {
-        const formattedTickets = ticketsResponse.tickets.map(ticket => ({
-          ...ticket,
-          id: ticket.ado_ticket_id || ticket.servicenow_sys_id || ticket.id || `TKT-${Date.now()}`,
-          ado_ticket_id: ticket.ado_ticket_id,
-          servicenow_sys_id: ticket.servicenow_sys_id,
-          ticket_title: ticket.ticket_title || ticket.subject || 'No Subject',
-          ticket_description: ticket.ticket_description || 'No description provided',
-          sender: ticket.sender || 'Unknown',
-          type_of_request: ticket.type_of_request || 'Unknown',
-          status: ticket.status || 'new',
-          requester: ticket.sender ? { name: ticket.sender, email: ticket.sender } : { name: 'Unknown', email: 'unknown@example.com' },
-          emailContent: ticket.subject || '',
-          timestamps: { created: ticket.last_updated_on || new Date().toISOString() },
-          events: ticket.events || [],
-          tags: ticket.tags || [],
-          comments: ticket.comments || [],
-          priority: ticket.priority || 'medium',
-          agentType: ticket.agentType || 'semi-autonomous',
-          pending_actions: ticket.pending_actions || false,
-          updates: ticket.updates || [],
-          email_chain: ticket.email_chain || [],
-          details: ticket.details || {},
-        }));
-        setTickets(formattedTickets);
-        setMetricsData(calculateMetrics(formattedTickets));
-      } else {
-        // toast({ // REMOVED
-        //   title: "Error",
-        //   description: "Failed to fetch tickets",
-        //   variant: "destructive",
-        // });
-        console.error("Failed to fetch tickets"); // Replaced with console log
+        if (ticketsResponse.status === 'success' && ticketsResponse.tickets) {
+          const formattedTickets = ticketsResponse.tickets.map(ticket => ({
+            ...ticket,
+            id: ticket.ado_ticket_id || ticket.servicenow_sys_id || ticket.id || `TKT-${Date.now()}`,
+            ado_ticket_id: ticket.ado_ticket_id,
+            servicenow_sys_id: ticket.servicenow_sys_id,
+            ticket_title: ticket.ticket_title || ticket.subject || 'No Subject',
+            ticket_description: ticket.ticket_description || 'No description provided',
+            sender: ticket.sender || 'Unknown',
+            type_of_request: ticket.type_of_request || 'Unknown',
+            status: ticket.status || 'new',
+            requester: ticket.sender ? { name: ticket.sender, email: ticket.sender } : { name: 'Unknown', email: 'unknown@example.com' },
+            emailContent: ticket.subject || '',
+            timestamps: { created: ticket.last_updated_on || new Date().toISOString() },
+            events: ticket.events || [],
+            tags: ticket.tags || [],
+            comments: ticket.comments || [],
+            priority: ticket.priority || 'medium',
+            agentType: ticket.agentType || 'semi-autonomous',
+            pending_actions: ticket.pending_actions || false,
+            updates: ticket.updates || [],
+            email_chain: ticket.email_chain || [],
+            details: ticket.details || {},
+          }));
+          setTickets(formattedTickets);
+          setMetricsData(calculateMetrics(formattedTickets));
+        } else {
+          console.error("Failed to fetch tickets");
+        }
+
+        if (statusResponse.status === 'success') {
+          setIsAgentActive(statusResponse.is_running);
+        }
+      } catch (error) {
+        console.error('Error fetching data:', error);
       }
+    };
 
-      if (statusResponse.status === 'success') {
-        setIsAgentActive(statusResponse.is_running);
-      }
-    } catch (error) {
-      console.error('Error fetching data:', error);
-      // toast({ // REMOVED
-      //   title: "Error",
-      //   description: "Failed to fetch initial data",
-      //   variant: "destructive",
-      // });
-    }
-  };
+    fetchData();
 
-  fetchData();
-
-    const ws = connectWebSocket();
-    const unsubscribe = addWebSocketListener((data) => {
+    const handleMessage = (data: any) => {
       console.log('WebSocket message received:', data);
       const message: BroadcastMessage = {
         id: `msg-${Date.now()}-${data.email_id || data.session_id || Math.random()}`,
@@ -166,17 +215,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         message: data.message,
       };
 
-      // Add message to broadcastMessages
-      setBroadcastMessages(prev => [message, ...prev].slice(0, 100));
+      setBroadcastMessages(prev => {
+        const newMessages = [message, ...prev].slice(0, 50); // Reduced limit to 50
+        return newMessages;
+      });
       console.log('Broadcast message added:', message);
 
       if (data.type === 'session') {
         setIsAgentActive(data.status === 'started');
-        // toast({ // REMOVED
-        //   title: data.status === 'started' ? "Agent Started" : "Agent Stopped",
-        //   description: `Session ID: ${data.session_id || 'N/A'}`,
-        // });
-        console.log(`Agent ${data.status === 'started' ? 'Started' : 'Stopped'}. Session ID: ${data.session_id || 'N/A'}`); // Replaced with console log
+        console.log(`Agent ${data.status === 'started' ? 'Started' : 'Stopped'}. Session ID: ${data.session_id || 'N/A'}`);
       } else if (data.type === 'ticket') {
         setTickets(prev => {
           const newTicket = {
@@ -196,45 +243,36 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             email_chain: data.ticket.email_chain || [],
             details: data.ticket.details || {},
           };
-          const newTickets = [newTicket, ...prev.filter(t => t.ado_ticket_id !== newTicket.ado_ticket_id && t.servicenow_sys_id !== newTicket.servicenow_sys_id)];
+          const newTickets = [newTicket, ...prev.filter(t => t.id !== newTicket.id && t.ado_ticket_id !== newTicket.ado_ticket_id && t.servicenow_sys_id !== newTicket.servicenow_sys_id)];
           setMetricsData(calculateMetrics(newTickets));
           return newTickets;
         });
         setCurrentNewTicket(data.ticket);
         setShowNewTicketNotification(true);
-        // toast({ // REMOVED
-        //   title: "New Ticket Received",
-        //   description: `Ticket: ${data.ticket.subject || 'No Subject'}`,
-        // });
-        console.log(`New Ticket Received: ${data.ticket.subject || 'No Subject'}`); // Replaced with console log
-      } else if (['email_detected', 'intent_analyzed', 'ticket_created', 'action_performed', 'email_reply', 'monitoring_started', 'monitoring_stopped', 'permission_fixed', 'script_execution_failed'].includes(data.type)) {
-        // toast({ // REMOVED
-        //   title: messageTypeLabels[data.type] || data.type,
-        //   description: `${data.subject || data.intent || data.message || 'Action processed'}`,
-        // });
-        console.log(`${messageTypeLabels[data.type] || data.type}: ${data.subject || data.intent || data.message || 'Action processed'}`); // Replaced with console log
+        console.log(`New Ticket Received: ${data.ticket.subject || 'No Subject'}`);
+      } else if (['email_detected', 'intent_analyzed', 'ticket_created', 'action_performed', 'email_reply', 'monitoring_started', 'monitoring_stopped', 'permission_fixed', 'script_execution_failed', 'ticket_updated'].includes(data.type)) {
+        console.log(`${messageTypeLabels[data.type] || data.type}: ${data.subject || data.intent || data.message || 'Action completed'}`);
       }
-    });
+    };
+
+    wsRef.current = connectWebSocket(handleMessage);
 
     return () => {
-      unsubscribe();
-      ws.close();
+      wsRef.current?.close();
     };
-  }, [
-    // toast // REMOVE this from dependency array
-  ]);
+  }, []);
 
   const getTicketById = (id: string) => {
     return tickets.find(ticket => ticket.id === id || ticket.ado_ticket_id === id || ticket.servicenow_sys_id === id);
   };
 
   const updateTicketStatus = (id: string, status: Ticket['status']) => {
-    let updatedTickets: Ticket[] = []; // Temporary variable to hold the updated tickets
+    let updatedTickets: Ticket[] = [];
 
     setTickets(prev => {
       const newState = prev.map(ticket => {
         if (ticket.id === id || ticket.ado_ticket_id === id || ticket.servicenow_sys_id === id) {
-          const statusEvent: Event = {
+          const statusEvent = {
             id: `evt-status-${Date.now()}`,
             timestamp: new Date().toISOString(),
             description: `Ticket status changed to ${status}`,
@@ -257,21 +295,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
         return ticket;
       });
-      updatedTickets = newState; // Capture the new state for metrics calculation
+      updatedTickets = newState;
       return newState;
     });
 
-    // Calculate metrics based on the *updated* tickets array
     setMetricsData(calculateMetrics(updatedTickets));
 
     if (status === 'completed' || status === 'failed') {
       const ticket = updatedTickets.find(t => t.id === id || t.ado_ticket_id === id || t.servicenow_sys_id === id);
-      // toast({ // REMOVED
-      //   title: `Ticket ${status === 'completed' ? 'Completed' : 'Failed'}`,
-      //   description: `${id}: ${ticket?.subject || 'No Subject'}`,
-      //   variant: status === 'completed' ? 'default' : 'destructive',
-      // });
-      console.log(`Ticket ${status === 'completed' ? 'Completed' : 'Failed'}: ${id}: ${ticket?.subject || 'No Subject'}`); // Replaced with console log
+      console.log(`Ticket ${status === 'completed' ? 'Completed' : 'Failed'}: ${id}: ${ticket?.subject || ''}`);
     }
   };
 
@@ -302,16 +334,4 @@ export const useApp = () => {
     throw new Error('useApp must be used within an AppProvider');
   }
   return context;
-};
-
-const messageTypeLabels: Record<string, string> = {
-  email_detected: "Email Detected",
-  intent_analyzed: "Intent Analyzed",
-  ticket_created: "Ticket Created",
-  action_performed: "Action Performed",
-  email_reply: "Email Reply Sent",
-  monitoring_started: "Monitoring Started",
-  monitoring_stopped: "Monitoring Stopped",
-  permission_fixed: "Permission Fixed",
-  script_execution_failed: "Script Execution Failed",
 };
