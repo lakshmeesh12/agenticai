@@ -5,10 +5,9 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Inbox, Send, Trash2, Archive, Star, Clock, Activity, AlertCircle, Loader2 } from "lucide-react";
-import Navbar from "@/components/layout/Navbar"; // MODIFICATION: Imported the Navbar component
+import Navbar from "@/components/layout/Navbar";
 
-// --- All utility functions and interfaces remain unchanged ---
-
+// --- Utility functions and interfaces remain unchanged ---
 interface BroadcastMessage {
   id: string;
   type: string;
@@ -42,6 +41,12 @@ interface Cycle {
   lastCompletionTimestamp?: string;
 }
 
+interface Notification {
+  id: string;
+  message: BroadcastMessage;
+}
+
+// --- Existing utility functions (unchanged) ---
 const formatDistanceToNow = (date: Date, options?: { addSuffix?: boolean }) => {
   const now = new Date();
   const diffInMs = now.getTime() - date.getTime();
@@ -62,7 +67,6 @@ const formatDistanceToNow = (date: Date, options?: { addSuffix?: boolean }) => {
 
   return options?.addSuffix ? `${result} ago` : result;
 };
-
 
 const messageTypeLabels: Record<string, string> = {
   email_detected: "Email Detected",
@@ -101,18 +105,43 @@ const getMessageTypeLogo = (message: BroadcastMessage): string | null => {
     case "email_detected":
       return "https://logospng.org/download/microsoft-outlook/logo-microsoft-outlook-1024.png";
     case "intent_analyzed":
-      return "https://img.freepik.com/premium-photo/friendly-looking-ai-agent-as-logo-white-background-style-raw-job-id-b7b07c82b6574fb8bb64985b261a_343960-69669.jpg";
+      return "https://img.freepik.com/premium-vector/ai-logo-template-vector-with-white-background_1023984-15069.jpg?w=360";
     case "ticket_created":
     case "ticket_updated":
       return "https://th.bing.com/th/id/OIP.SMNthTKl4UDNMsEYDToSDgHaEK?w=1024&h=576&rs=1&pid=ImgDetMain";
     case "email_reply":
       return "https://1000logos.net/wp-content/uploads/2018/05/Gmail-Logo-500x281.jpg";
+    case "monitoring_started":
+    case "monitoring_stopped":
+      return "https://res.cloudinary.com/hy4kyit2a/f_auto,fl_lossy,q_70/learn/modules/monitoring-on-aws/monitor-your-architecture-with-amazon-cloudwatch/images/522c742e37be736db2af0f8a720b1c02_f-05-f-9-a-02-2-a-81-4-fa-3-b-651-412-e-2222-bd-08.png";
     case "action_performed":
       const messageText = message.message || "";
-      if (messageText.includes("Pull access granted") ||
-        messageText.includes("Push access granted") ||
-        messageText.includes("Access revoked")) {
+      if (messageText.toLowerCase().includes("s3 bucket")) {
+        return "https://seekvectors.com/storage/images/072095bef5407decc46caf5ace643475.jpg";
+      }
+      if (messageText.toLowerCase().includes("script") && messageText.toLowerCase().includes("executed successfully")) {
+        return "https://seekvectors.com/storage/images/072095bef5407decc46caf5ace643475.jpg";
+      }
+      if (
+        messageText.toLowerCase().includes("repository") ||
+        messageText.toLowerCase().includes("repo") ||
+        (messageText.toLowerCase().includes("file") && messageText.toLowerCase().includes("commit"))
+      ) {
         return "https://th.bing.com/th/id/OIP.Vn8Aa5ypdPND2xyceZIAdAHaHS?rs=1&pid=ImgDetMain";
+      }
+      if (
+        messageText.includes("Pull access granted") ||
+        messageText.includes("Push access granted") ||
+        messageText.includes("Access revoked")
+      ) {
+        return "https://th.bing.com/th/id/OIP.Vn8Aa5ypdPND2xyceZIAdAHaHS?rs=1&pid=ImgDetMain";
+      }
+      if (
+        messageText.toLowerCase().includes("permission") ||
+        messageText.toLowerCase().includes("policy") ||
+        messageText.toLowerCase().includes("role")
+      ) {
+        return "https://res.cloudinary.com/hy4kyit2a/f_auto,fl_lossy,q_70/learn/modules/monitoring-on-aws/monitor-your-architecture-with-amazon-cloudwatch/images/522c742e37be736db2af0f8a720b1c02_f-05-f-9-a-02-2-a-81-4-fa-3-b-651-412-e-2222-bd-08.png";
       }
       return null;
     default:
@@ -123,23 +152,27 @@ const getMessageTypeLogo = (message: BroadcastMessage): string | null => {
 const getMessageDetails = (message: BroadcastMessage): string => {
   switch (message.type) {
     case "email_detected":
-      return `Subject: ${message.subject || "No Subject"}, From: ${message.sender || "Unknown"}${message.is_valid_domain === false ? ' - <span class="text-red-600 font-medium">UNAUTHORIZED DOMAIN</span>' : ""
-        }`;
+      return `Subject: ${message.subject || "No Subject"}, From: ${message.sender || "Unknown"}${
+        message.is_valid_domain === false ? ' - <span class="text-red-600 font-medium">UNAUTHORIZED DOMAIN</span>' : ""
+      }`;
     case "intent_analyzed":
-      return `Intent: ${message.intent || "Unknown"}${message.pending_actions !== undefined ? `, Pending Actions: ${message.pending_actions ? "Yes" : "No"}` : ""
-        }`;
+      return `Intent: ${message.intent || "Unknown"}${
+        message.pending_actions !== undefined ? `, Pending Actions: ${message.pending_actions ? "Yes" : "No"}` : ""
+      }`;
     case "ticket_created":
       return [
         message.ado_ticket_id &&
-        `ADO Ticket ID: ${message.ado_ticket_id}${message.ado_url
-          ? `, <a href="${message.ado_url}" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:underline">View in ADO</a>`
-          : ""
-        }`,
+          `ADO Ticket ID: ${message.ado_ticket_id}${
+            message.ado_url
+              ? `, <a href="${message.ado_url}" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:underline">View in ADO</a>`
+              : ""
+          }`,
         message.servicenow_sys_id &&
-        `ServiceNow ID: ${message.servicenow_sys_id}${message.servicenow_url
-          ? `, <a href="${message.servicenow_url}" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:underline">View in ServiceNow</a>`
-          : ""
-        }`,
+          `ServiceNow ID: ${message.servicenow_sys_id}${
+            message.servicenow_url
+              ? `, <a href="${message.servicenow_url}" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:underline">View in ServiceNow</a>`
+              : ""
+          }`,
         message.intent && `Intent: ${message.intent}`,
       ]
         .filter(Boolean)
@@ -196,7 +229,6 @@ const getMessageDetails = (message: BroadcastMessage): string => {
         .filter(Boolean)
         .join("; ");
     case "email_reply":
-      // MODIFICATION: Display only the message field
       return message.message || "No reply message available";
     case "session":
       return message.status ? `Status: ${message.status}` : "No status available";
@@ -248,15 +280,16 @@ const getCyclePreview = (cycle: Cycle): string => {
   return details.length > 60 ? `${details.substring(0, 60)}...` : details;
 };
 
-
 export const RequestsTracker = () => {
   const { broadcastMessages } = useApp();
   const [cycles, setCycles] = useState<Cycle[]>([]);
   const [selectedCycle, setSelectedCycle] = useState<Cycle | null>(null);
   const [allMessages, setAllMessages] = useState<BroadcastMessage[]>([]);
+  const [notifications, setNotifications] = useState<Notification[]>([]);
   const [sidebarWidth, setSidebarWidth] = useState(350);
   const isResizing = useRef(false);
 
+  // Handle sidebar resizing
   const handleMouseDown = (e: React.MouseEvent) => {
     isResizing.current = true;
     document.addEventListener('mousemove', handleMouseMove);
@@ -278,6 +311,7 @@ export const RequestsTracker = () => {
     document.removeEventListener('mouseup', handleMouseUp);
   };
 
+  // Load stored messages from localStorage
   useEffect(() => {
     const storedMessages = localStorage.getItem('activityMessages');
     if (storedMessages) {
@@ -290,12 +324,35 @@ export const RequestsTracker = () => {
     }
   }, []);
 
+  // Save messages to localStorage
   useEffect(() => {
     if (allMessages.length > 0) {
       localStorage.setItem('activityMessages', JSON.stringify(allMessages));
     }
   }, [allMessages]);
 
+  // Handle new broadcast messages and trigger notifications for email_detected
+  useEffect(() => {
+    const newMessages = broadcastMessages.filter(
+      (msg) => !allMessages.some((existing) => existing.id === msg.id)
+    );
+    setAllMessages((prev) => [...prev, ...newMessages]);
+
+    // Trigger notifications for new email_detected messages
+    newMessages.forEach((msg) => {
+      if (msg.type === 'email_detected') {
+        const newNotification: Notification = { id: msg.id, message: msg };
+        setNotifications((prev) => [...prev, newNotification]);
+
+        // Auto-dismiss after 5 seconds
+        setTimeout(() => {
+          setNotifications((prev) => prev.filter((n) => n.id !== msg.id));
+        }, 5000);
+      }
+    });
+  }, [broadcastMessages, allMessages]);
+
+  // Handle cycle deletion
   const handleDeleteCycle = (cycleKey: string) => {
     setCycles((prevCycles) => {
       const updatedCycles = prevCycles.filter(
@@ -315,14 +372,8 @@ export const RequestsTracker = () => {
     });
   };
 
+  // Process cycles (unchanged)
   useEffect(() => {
-    setAllMessages((prev) => {
-      const newMessages = broadcastMessages.filter(
-        (msg) => !prev.some((existing) => existing.id === msg.id)
-      );
-      return [...prev, ...newMessages];
-    });
-
     const combinedMessages = [...allMessages, ...broadcastMessages].reduce((acc, msg) => {
       if (!acc.find((m) => m.id === msg.id)) {
         acc.push(msg);
@@ -427,9 +478,12 @@ export const RequestsTracker = () => {
     }
   }, [broadcastMessages, allMessages]);
 
+  // Handle notification close
+  const handleCloseNotification = (id: string) => {
+    setNotifications((prev) => prev.filter((n) => n.id !== id));
+  };
 
   return (
-    // MODIFICATION: Added a root fragment and a flex container to hold the Navbar and the main content.
     <div className="flex flex-col h-screen bg-white">
       <Navbar />
       <div className="flex flex-1 overflow-hidden">
@@ -518,7 +572,7 @@ export const RequestsTracker = () => {
         />
 
         {/* Agent Activity Log Detail Pane */}
-        <div className="flex-1 bg-white flex flex-col shadow-inner">
+        <div className="flex-1 bg-white flex flex-col shadow-inner relative">
           {selectedCycle ? (
             <>
               <div className="p-4 border-b border-gray-200 bg-gradient-to-r from-gray-50 to-white">
@@ -628,8 +682,67 @@ export const RequestsTracker = () => {
               </div>
             </div>
           )}
+
+          {/* Notification Container */}
+          <div className="fixed bottom-6 right-6 space-y-3 pointer-events-none">
+            {notifications.map((notification) => (
+              <div
+                key={notification.id}
+                className="pointer-events-auto bg-white rounded-lg shadow-2xl border border-gray-200 w-96 p-4 transform transition-all duration-300 ease-in-out animate-slide-in hover:scale-102"
+              >
+                <div className="flex items-start">
+                  <img
+                    src={getMessageTypeLogo(notification.message) || ""}
+                    alt="Outlook Logo"
+                    className="h-8 w-8 object-contain rounded mt-1"
+                  />
+                  <div className="ml-4 flex-1">
+                    <div className="flex justify-between items-center mb-2">
+                      <p className="text-base font-semibold text-gray-900">New Email Detected</p>
+                      <button
+                        onClick={() => handleCloseNotification(notification.id)}
+                        className="text-gray-500 hover:text-gray-700 focus:outline-none rounded-full p-1 hover:bg-gray-100 transition-colors"
+                        aria-label="Close notification"
+                      >
+                        <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      </button>
+                    </div>
+                    <p className="text-sm text-gray-600 truncate">From: {notification.message.sender || "Unknown"}</p>
+                    <p className="text-sm text-gray-800 font-medium truncate mt-1">
+                      {notification.message.subject || "No Subject"}
+                    </p>
+                    {notification.message.is_valid_domain === false && (
+                      <p className="text-sm text-red-600 font-medium mt-1">UNAUTHORIZED DOMAIN</p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       </div>
+
+      {/* Custom Animation Styles */}
+      <style>{`
+        @keyframes slide-in {
+          from {
+            transform: translateX(100%);
+            opacity: 0;
+          }
+          to {
+            transform: translateX(0);
+            opacity: 1;
+          }
+        }
+        .animate-slide-in {
+          animation: slide-in 0.3s ease-out;
+        }
+        .hover\\:scale-102:hover {
+          transform: scale(1.02);
+        }
+      `}</style>
     </div>
   );
 };
