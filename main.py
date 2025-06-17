@@ -23,6 +23,11 @@ from task_manager import TaskManager
 from servicenow import ServiceNowPlugin
 from typing import Optional
 import hashlib
+from fastapi import WebSocket, WebSocketDisconnect
+from websockets.exceptions import ConnectionClosed
+from starlette.websockets import WebSocketState
+from starlette.exceptions import WebSocketException
+from typing import Set
 
 # Configure logging
 logging.basicConfig(
@@ -49,6 +54,9 @@ app.add_middleware(
 
 # Load environment variables
 load_dotenv()
+
+# Explicitly define websocket_clients as a Set[WebSocket]
+websocket_clients: Set[WebSocket] = set()
 
 # Initialize MongoDB
 mongo_client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
@@ -918,29 +926,148 @@ async def get_request_types():
         logger.error(f"Error fetching request types: {str(e)}")
         return {"status": "error", "message": str(e)}
 
+# Heartbeat interval and timeout settings
+HEARTBEAT_INTERVAL = 30  # seconds
+WEBSOCKET_TIMEOUT = 3600  # 1 hour
+MAX_CLIENTS = 100  # Limit number of concurrent clients
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """Handle WebSocket connections."""
-    await websocket.accept()
-    logger.info("WebSocket connection accepted")
-    websocket_clients.append(websocket)
+    """Handle WebSocket connections with heartbeat and robust error handling."""
+    global websocket_clients
     try:
+        if len(websocket_clients) >= MAX_CLIENTS:
+            logger.warning(f"Max clients ({MAX_CLIENTS}) reached, rejecting connection from {websocket.client}")
+            await websocket.close(code=1011)  # Server overloaded
+            return
+
+        await websocket.accept()
+        logger.info(f"WebSocket connection accepted: {websocket.client}")
+
+        if not isinstance(websocket_clients, set):
+            logger.error(f"websocket_clients is not a set, found type: {type(websocket_clients)}")
+            websocket_clients = set()
+            logger.info("Reinitialized websocket_clients as set")
+
+        websocket_clients.add(websocket)
+
+        # Send initial ping to confirm connection
+        await websocket.send_json({"type": "ping"})
+        
         while True:
-            await websocket.receive_text()
+            try:
+                async def heartbeat():
+                    while websocket.client_state == WebSocketState.CONNECTED:
+                        try:
+                            await websocket.send_json({"type": "ping"})
+                            logger.debug("Sent heartbeat ping")
+                            await asyncio.sleep(HEARTBEAT_INTERVAL)
+                        except Exception as e:
+                            logger.warning(f"Heartbeat failed: {str(e)}")
+                            break
+
+                heartbeat_task = asyncio.create_task(heartbeat())
+
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=WEBSOCKET_TIMEOUT)
+                logger.debug(f"Received WebSocket message: {data}")
+                if data == "pong":
+                    logger.debug("Received pong response")
+                
+            except asyncio.TimeoutError:
+                logger.warning("WebSocket receive timeout, sending ping to check connection")
+                await websocket.send_json({"type": "ping"})
+                continue
+            except WebSocketDisconnect:
+                logger.info("WebSocket disconnected normally")
+                break
+            except WebSocketException as e:
+                logger.error(f"WebSocket protocol error: {str(e)}")
+                break
+            except Exception as e:
+                logger.error(f"Unexpected WebSocket error: {str(e)}")
+                break
+            finally:
+                if 'heartbeat_task' in locals():
+                    heartbeat_task.cancel()
+                    
     except Exception as e:
-        logger.error(f"WebSocket error: {str(e)}")
-        websocket_clients.remove(websocket)
+        logger.error(f"WebSocket connection setup error: {str(e)}")
     finally:
-        logger.info("WebSocket connection closed")
+        if isinstance(websocket_clients, set):
+            websocket_clients.discard(websocket)
+        else:
+            logger.error(f"Cannot discard client, websocket_clients is {type(websocket_clients)}")
+        logger.info("WebSocket connection cleaned up")
 
 async def broadcast(message):
-    """Broadcast a message to all WebSocket connections."""
+    """Broadcast a message to all WebSocket connections with robust error handling."""
+    if not websocket_clients:
+        logger.debug("No WebSocket clients to broadcast to")
+        return
+
     logger.info(f"Broadcasting message: {message}")
-    for client in websocket_clients:
+    clients_to_remove = set()
+
+    if not isinstance(websocket_clients, set):
+        logger.error(f"websocket_clients is not a set in broadcast, found type: {type(websocket_clients)}")
+        return
+
+    for client in websocket_clients.copy():
         try:
+            if client.client_state != WebSocketState.CONNECTED:
+                logger.debug(f"Client {client.client} is not connected, marking for removal")
+                clients_to_remove.add(client)
+                continue
+
             await client.send_json(message)
+            logger.debug(f"Message sent successfully to client {client.client}")
+
+        except WebSocketDisconnect:
+            logger.info(f"Client {client.client} disconnected during broadcast")
+            clients_to_remove.add(client)
+        except WebSocketException as e:
+            logger.info(f"WebSocket protocol error during broadcast: {str(e)}")
+            clients_to_remove.add(client)
+        except RuntimeError as e:
+            if "close message has been sent" in str(e) or "WebSocket is not connected" in str(e):
+                logger.info(f"Attempted to send to closed WebSocket {client.client}")
+                clients_to_remove.add(client)
+            else:
+                logger.error(f"Runtime error broadcasting to WebSocket {client.client}: {str(e)}")
+                clients_to_remove.add(client)
         except Exception as e:
-            logger.error(f"Error broadcasting to WebSocket: {str(e)}")
+            logger.error(f"Unexpected error broadcasting to WebSocket {client.client}: {str(e)}")
+            clients_to_remove.add(client)
+
+    if clients_to_remove:
+        websocket_clients.difference_update(clients_to_remove)
+        logger.info(f"Removed {len(clients_to_remove)} disconnected clients")
+
+@app.on_event("startup")
+async def startup_event():
+    """Log server startup and verify websocket_clients type."""
+    global websocket_clients
+    logger.info("WebSocket server started with heartbeat interval %s seconds and timeout %s seconds", 
+                HEARTBEAT_INTERVAL, WEBSOCKET_TIMEOUT)
+    if not isinstance(websocket_clients, set):
+        logger.error(f"websocket_clients is not a set at startup, found type: {type(websocket_clients)}")
+        websocket_clients = set()
+        logger.info("Initialized websocket_clients as set")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Gracefully close all WebSocket connections on shutdown."""
+    global websocket_clients
+    logger.info("Shutting down WebSocket server")
+    for client in websocket_clients.copy():
+        try:
+            if client.client_state == WebSocketState.CONNECTED:
+                await client.close()
+        except Exception as e:
+            logger.error(f"Error closing WebSocket client {client.client}: {str(e)}")
+        finally:
+            websocket_clients.discard(client)
+    logger.info("All WebSocket connections closed")
 
 @app.get("/")
 async def root():

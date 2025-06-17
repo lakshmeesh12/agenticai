@@ -667,13 +667,6 @@ fi
                             monitor_task = True  # Flag to indicate monitoring has started
                     except Exception as e:
                         logger.error(f"Error starting monitoring: {str(e)}")
-                        if broadcast and email_id:
-                            await broadcast({
-                                "type": "action_performed",
-                                "email_id": email_id,
-                                "success": False,
-                                "message": f"Error starting monitoring: {str(e)}"
-                            })
 
                 if result["success"]:
                     if enable_cloudwatch_monitoring and monitor_task:
