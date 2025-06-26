@@ -7,6 +7,10 @@ const WS_URL = "ws://localhost:8000/ws"; // Replace with your WebSocket URL
 interface ApiResponse<T> {
   status: "success" | "error" | "info";
   message?: string;
+  query?: string;
+  response?: string;
+  results?: string;
+  detail?: string;
   [key: string]: any;
 }
 
@@ -65,8 +69,11 @@ export function disconnectWebSocket() {
 }
 
 // API functions
-export async function runAgent() {
-  return fetchApi<{ session_id: string }>("/run-agent", { method: "GET" });
+export async function runAgent(platforms: string[] = ["ado", "servicenow"]) {
+  return fetchApi<{ session_id: string }>("/run-agent", {
+    method: "POST",
+    body: JSON.stringify({ platforms }),
+  });
 }
 
 export async function stopAgent() {
@@ -83,10 +90,10 @@ export async function getTicketsByType(requestType: string) {
   });
 }
 
-export async function sendRequest(adminRequest: AdminRequest) {
-  return fetchApi<{ summary_intent: string; response: string }>("/send-request", {
+export async function sendRequest(queryData: { query: string }) {
+  return fetchApi<{ query: string; response: string; results: string }>("/send-request", {
     method: "POST",
-    body: JSON.stringify(adminRequest),
+    body: JSON.stringify(queryData),
   });
 }
 
