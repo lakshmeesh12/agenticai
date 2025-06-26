@@ -24,7 +24,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class SKAgent:
-    def __init__(self, kernel: Kernel, tickets_collection: Collection):
+    def __init__(self, kernel: Kernel, tickets_collection: Collection, platforms: list[str] = ["ado", "servicenow"]):
         self.kernel = kernel
         self.tickets_collection = tickets_collection
         self.monitor_tasks = {}
@@ -41,6 +41,12 @@ class SKAgent:
         if "monitor" not in self.kernel.plugins:
             self.kernel.add_plugin(MonitorPlugin(), plugin_name="monitor")
             logger.info("Registered MonitorPlugin in SKAgent")
+        self.monitor_tasks = {}
+        # Validate and store platforms
+        valid_platforms = {"ado", "servicenow"}
+        self.platforms = [p.lower() for p in platforms if p.lower() in valid_platforms]
+        if not self.platforms:
+            self.platforms = ["ado", "servicenow"]
             
         # Initialize Milvus connection and sentence transformer model
         self.milvus_collection_name = "ticket_details"
@@ -113,6 +119,7 @@ class SKAgent:
             
             self.milvus_collection.load()
             logger.info(f"Loaded collection {self.milvus_collection_name}")
+            
             
         except Exception as e:
             logger.error(f"Failed to connect to Milvus or initialize collection: {str(e)}")
@@ -1109,6 +1116,13 @@ class SKAgent:
             thread_id = email.get("threadId", email_id)
             attachments = email.get("attachments", [])
             is_follow_up = bool(existing_ticket)
+            monitor_task = None
+            intent = None
+            ado_ticket_id = existing_ticket.get("ado_ticket_id") if is_follow_up and "ado" in self.platforms else None
+            servicenow_sys_id = existing_ticket.get("servicenow_sys_id") if is_follow_up and "servicenow" in self.platforms else None
+            completed_actions = []
+            pending_actions = False
+            ticket_status = existing_ticket.get("status", "Pending") if is_follow_up else "Pending"
 
             # Broadcast email detection
             await broadcast({
@@ -1119,36 +1133,13 @@ class SKAgent:
                 "thread_id": thread_id
             })
 
-            # Analyze intent
-            intent_result = await self.analyze_intent(subject, body, attachments)
+            # Analyze intent and extract details
+            intent_result, details = await self._analyze_and_extract(email, existing_ticket)
             intent = intent_result["intent"]
             ticket_description = intent_result["ticket_description"]
             pending_actions = intent_result["pending_actions"] or (existing_ticket.get("pending_actions", False) if is_follow_up else False)
             sub_intents = intent_result.get("sub_intents", [])
             enable_cloudwatch_monitoring = intent_result.get("enable_cloudwatch_monitoring", False)
-
-            # Extract details based on intent
-            details = {
-                "repo_name": intent_result.get("repo_name", "unspecified"),
-                "access_type": intent_result.get("access_type", "unspecified"),
-                "github_username": intent_result.get("github_username", "unspecified"),
-                "bucket_name": intent_result.get("bucket_name", "unspecified"),
-                "region": intent_result.get("region", "us-east-1"),
-                "acl": intent_result.get("acl", "unspecified"),
-                "instance_type": intent_result.get("instance_type", "unspecified"),
-                "ami_id": intent_result.get("ami_id", "unspecified"),
-                "instance_id": intent_result.get("instance_id", "unspecified"),
-                "username": intent_result.get("username", "unspecified"),
-                "permission": intent_result.get("permission", "unspecified"),
-                "file_name": intent_result.get("file_name", "unspecified"),
-                "source_bucket": intent_result.get("source_bucket", "unspecified"),
-                "destination_bucket": intent_result.get("destination_bucket", "unspecified"),
-                "script_name": intent_result.get("script_name", "unspecified"),
-                "file_content": intent_result.get("file_content", ""),
-                "enable_cloudwatch_monitoring": enable_cloudwatch_monitoring,
-                "log_group_name": intent_result.get("log_group_name", "EC2logs"),
-                "monitor_interval": intent_result.get("monitor_interval", 5)
-            }
 
             await broadcast({
                 "type": "intent_analyzed",
@@ -1159,1147 +1150,36 @@ class SKAgent:
                 "thread_id": thread_id
             })
 
-            # Start monitoring before actions for relevant intents
-            monitor_task = None
-            if (intent == "git_and_aws_intent" or intent == "aws_ec2_run_script") and enable_cloudwatch_monitoring and details["instance_id"] != "unspecified":
-                logger.debug(f"Monitor plugin available before starting monitoring: {'monitor' in self.kernel.plugins}")
-                if "monitor" in self.kernel.plugins:
-                    logger.info(f"Starting CloudWatch monitoring for instance {details['instance_id']} after intent analysis")
-                    try:
-                        monitor_task = asyncio.create_task(
-                            self.kernel.invoke(
-                                self.kernel.plugins["monitor"]["start_monitoring"],
-                                instance_id=details["instance_id"],
-                                log_group_name=details.get("log_group_name", "EC2logs"),
-                                interval=details.get("monitor_interval", 5),
-                                region=details["region"],
-                                email_id=email_id,
-                                broadcast=broadcast
-                            )
-                        )
-                        self.monitor_tasks[details["instance_id"]] = monitor_task
-                        logger.info(f"Monitoring task created for instance {details['instance_id']} after intent analysis")
-                        await broadcast({
-                            "type": "monitoring_started",
-                            "email_id": email_id,
-                            "instance_id": details["instance_id"],
-                            "message": f"Started CloudWatch monitoring for instance {details['instance_id']}",
-                            "thread_id": thread_id
-                        })
-                    except Exception as e:
-                        logger.error(f"Failed to start monitoring for instance {details['instance_id']} after intent analysis: {str(e)}")
-                        await broadcast({
-                            "type": "error",
-                            "email_id": email_id,
-                            "message": f"Failed to start CloudWatch monitoring: {str(e)}",
-                            "thread_id": thread_id
-                        })
-                else:
-                    logger.error("Monitor plugin not found in kernel.plugins")
-                    await broadcast({
-                        "type": "error",
-                        "email_id": email_id,
-                        "message": "Monitor plugin not found for CloudWatch monitoring",
-                        "thread_id": thread_id
-                    })
+            # Start monitoring if applicable
+            monitor_task = await self._start_monitoring_if_needed(
+                intent, enable_cloudwatch_monitoring, details, email_id, thread_id, broadcast
+            )
 
-            # Handle non-intent emails
-            if intent == "non_intent":
-                logger.info(f"Non-intent email detected (ID={email_id}). Stopping workflow.")
-                if is_follow_up:
-                    email_chain_entry = {
-                        "email_id": email_id,
-                        "from": sender,
-                        "subject": subject,
-                        "body": body,
-                        "timestamp": email.get("received", datetime.now().isoformat()),
-                        "attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]
-                    }
-                    self.tickets_collection.update_one(
-                        {"thread_id": thread_id},
-                        {"$push": {"email_chain": email_chain_entry}}
-                    )
-                    # Update Milvus with the latest ticket data
-                    updated_ticket = self.tickets_collection.find_one({"thread_id": thread_id})
-                    if updated_ticket:
-                        await self.send_to_milvus(updated_ticket)
-                else:
-                    ticket_record = {
-                        "ado_ticket_id": None,
-                        "servicenow_sys_id": None,
-                        "sender": sender,
-                        "subject": subject,
-                        "thread_id": thread_id,
-                        "email_id": email_id,
-                        "ticket_title": "Non-intent email",
-                        "ticket_description": ticket_description,
-                        "email_timestamp": datetime.now().isoformat(),
-                        "updates": [],
-                        "email_chain": [{
-                            "email_id": email_id,
-                            "from": sender,
-                            "subject": subject,
-                            "body": body,
-                            "timestamp": email.get("received", datetime.now().isoformat()),
-                            "attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]
-                        }],
-                        "pending_actions": False,
-                        "type_of_request": "non_intent",
-                        "details": {"attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]},
-                        "in_milvus": False
-                    }
-                    self.tickets_collection.insert_one(ticket_record)
-                    # No need to update Milvus for new non-intent tickets unless specified
-                if monitor_task:
-                    await self.stop_monitoring(details["instance_id"])
-                    await broadcast({
-                        "type": "monitoring_stopped",
-                        "email_id": email_id,
-                        "instance_id": details["instance_id"],
-                        "message": f"Stopped CloudWatch monitoring for instance {details['instance_id']}",
-                        "thread_id": thread_id
-                    })
-                return {
-                    "status": "success",
-                    "intent": "non_intent",
-                    "ado_ticket_id": existing_ticket["ado_ticket_id"] if is_follow_up else None,
-                    "servicenow_sys_id": existing_ticket["servicenow_sys_id"] if is_follow_up else None,
-                    "message": "Non-intent email processed; no further action taken",
-                    "actions": [],
-                    "pending_actions": False
-                }
-
-            # Handle request summary
-            if intent == "request_summary" and is_follow_up:
-                ticket_record = existing_ticket
-                summary_result = await self.generate_summary_response(ticket_record, f"Subject: {subject}\nBody: {body}")
-                email_response = summary_result["email_response"]
-
-                reply_result = await self.kernel.invoke(
-                    self.kernel.plugins["email_sender"]["send_reply"],
-                    to=sender,
-                    subject=subject,
-                    body=email_response,
-                    thread_id=thread_id,
-                    message_id=email_id,
-                    attachments=attachments,
-                    remediation=""
+            # Handle non-intent or request summary
+            if intent in ["non_intent", "request_summary"]:
+                result = await self._handle_special_intents(
+                    intent, email, existing_ticket, is_follow_up, monitor_task, details, broadcast
                 )
-                reply = reply_result.value if reply_result else None
+                result["ticket_status"] = ticket_status
+                return result
 
-                if reply:
-                    email_chain_entry = {
-                        "email_id": reply.get("message_id", str(uuid.uuid4())),
-                        "from": os.getenv('EMAIL_ADDRESS', 'IT Support <support@quadranttechnologies.com>'),
-                        "subject": subject,
-                        "body": email_response,
-                        "timestamp": datetime.now().isoformat(),
-                        "attachments": []
-                    }
-                    self.tickets_collection.update_one(
-                        {"thread_id": thread_id},
-                        {"$push": {"email_chain": email_chain_entry}}
-                    )
-                    # Update Milvus with the latest ticket data
-                    updated_ticket = self.tickets_collection.find_one({"thread_id": thread_id})
-                    if updated_ticket:
-                        await self.send_to_milvus(updated_ticket)
-                    await broadcast({
-                        "type": "email_reply",
-                        "email_id": email_id,
-                        "thread_id": thread_id,
-                        "ado_ticket_id": ticket_record["ado_ticket_id"],
-                        "servicenow_sys_id": ticket_record["servicenow_sys_id"],
-                        "message": f"Sent summary of ticket status for ADO ticket {ticket_record['ado_ticket_id']}",
-                        "timestamp": datetime.now().isoformat()
-                    })
-
-                if monitor_task:
-                    await self.stop_monitoring(details["instance_id"])
-                    await broadcast({
-                        "type": "monitoring_stopped",
-                        "email_id": email_id,
-                        "instance_id": details["instance_id"],
-                        "message": f"Stopped CloudWatch monitoring for instance {details['instance_id']}",
-                        "thread_id": thread_id
-                    })
-                return {
-                    "status": "success",
-                    "ado_ticket_id": ticket_record["ado_ticket_id"],
-                    "servicenow_sys_id": ticket_record["servicenow_sys_id"],
-                    "intent": intent,
-                    "summary_intent": summary_result["summary_intent"],
-                    "actions": [],
-                    "pending_actions": False
-                }
-
-            ado_ticket_id = existing_ticket["ado_ticket_id"] if is_follow_up else None
-            servicenow_sys_id = existing_ticket["servicenow_sys_id"] if is_follow_up else None
-            completed_actions = []
-            action_result = None
-            action_details = None
-
-            completion_intents = [
-                "github_revoke_access",
-                "github_delete_repo",
-                "aws_s3_delete_bucket",
-                "aws_ec2_terminate_instance",
-                "aws_iam_remove_user",
-                "aws_iam_remove_user_permission"
-            ]
-
-            sender_username = sender.split('<')[0].strip() if '<' in sender else (sender.split('@')[0] if '@' in sender else sender)
-
-            # Handle follow-up emails for actionable intents
-            if is_follow_up and intent in [
-                "github_access_request", "github_revoke_access", "github_create_repo", "github_commit_file", "github_delete_repo",
-                "aws_s3_create_bucket", "aws_s3_delete_bucket", "aws_ec2_launch_instance", "aws_ec2_terminate_instance",
-                "aws_iam_add_user", "aws_iam_remove_user", "aws_iam_add_user_permission", "aws_iam_remove_user_permission", "aws_ec2_run_script"
-            ]:
-                ado_ticket_id = existing_ticket["ado_ticket_id"]
-                servicenow_sys_id = existing_ticket["servicenow_sys_id"]
-                action_details = {
-                    "request_type": intent,
-                    "status": "pending",
-                    "message": f"Processing {intent}"
-                }
-                if intent.startswith("github_"):
-                    action_details.update({
-                        "repo_name": details["repo_name"],
-                        "username": details["github_username"],
-                        "access_type": details["access_type"] if intent == "github_access_request" else "unspecified",
-                        "file_name": details["file_name"] if intent == "github_commit_file" else "unspecified",
-                        "file_content": details["file_content"] if intent == "github_commit_file" else ""
-                    })
-                elif intent.startswith("aws_s3_"):
-                    action_details.update({
-                        "bucket_name": details["bucket_name"],
-                        "region": details["region"],
-                        "acl": details["acl"] if intent == "aws_s3_create_bucket" else "unspecified"
-                    })
-                elif intent.startswith("aws_ec2_"):
-                    action_details.update({
-                        "instance_type": details["instance_type"],
-                        "ami_id": details["ami_id"],
-                        "instance_id": details["instance_id"],
-                        "region": details["region"],
-                        "repo_name": details["repo_name"],
-                        "script_name": details["script_name"],
-                        "source_bucket": details["source_bucket"],
-                        "destination_bucket": details["destination_bucket"],
-                        "logs": ""
-                    })
-                elif intent.startswith("aws_iam_"):
-                    action_details.update({
-                        "username": details["username"],
-                        "permission": details["permission"] if "permission" in intent else "unspecified"
-                    })
-
-                update_operation = {
-                    "$push": {
-                        "details.aws" if intent.startswith("aws_") else "details.github": action_details,
-                        "updates": {
-                            "status": "Doing",
-                            "comment": action_details["message"],
-                            "revision_id": f"{intent.split('_')[1]}-{ado_ticket_id}-{len(existing_ticket.get('updates', [])) + 1}",
-                            "email_sent": False,
-                            "email_message_id": None,
-                            "email_timestamp": datetime.now().isoformat()
-                        }
-                    },
-                    "$set": {
-                        "pending_actions": pending_actions
-                    }
-                }
-                self.tickets_collection.update_one({"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id}, update_operation)
-
-                action_result = await self.perform_action(intent, details, broadcast=broadcast, email_id=email_id, thread_id=thread_id)
-                action_details["status"] = action_result.get("status", "failed")
-                action_details["message"] = action_result["message"]
-                if intent == "aws_ec2_launch_instance" and action_result.get("logs"):
-                    action_details["logs"] = action_result["logs"]
-                completed_actions.append({"action": intent, "completed": action_result["success"]})
-
-                if intent == "aws_ec2_run_script" and not action_result["success"]:
-                    await broadcast({
-                        "type": "script_execution_failed",
-                        "email_id": email_id,
-                        "ado_ticket_id": ado_ticket_id,
-                        "servicenow_sys_id": servicenow_sys_id,
-                        "success": False,
-                        "message": action_result["message"],
-                        "thread_id": thread_id
-                    })
-
-                if intent in completion_intents and action_result["success"]:
-                    pending_actions = False
-                    logger.info(f"Completion intent {intent} processed successfully for ticket ID={ado_ticket_id}/{servicenow_sys_id}. Setting pending_actions to False.")
-
-                array_filter = {
-                    "repo_name": details["repo_name"],
-                    "username": details["github_username"],
-                    "request_type": intent
-                } if intent.startswith("github_") else {
-                    "request_type": intent
-                }
-                update_operation = {
-                    "$set": {
-                        f"details.{'aws' if intent.startswith('aws_') else 'github'}.$[elem].status": action_details["status"],
-                        f"details.{'aws' if intent.startswith('aws_') else 'github'}.$[elem].message": action_details["message"],
-                        "pending_actions": pending_actions
-                    },
-                    "$push": {
-                        "updates": {
-                            "status": action_details["status"],
-                            "comment": action_details["message"],
-                            "revision_id": f"result-{ado_ticket_id}-{len(existing_ticket.get('updates', [])) + 2}",
-                            "email_sent": False,
-                            "email_message_id": None,
-                            "email_timestamp": datetime.now().isoformat()
-                        }
-                    }
-                }
-                if intent == "aws_ec2_launch_instance" and action_result.get("logs"):
-                    update_operation["$set"][f"details.aws.$[elem].logs"] = action_details["logs"]
-                try:
-                    self.tickets_collection.update_one(
-                        {"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id},
-                        update_operation,
-                        array_filters=[{"elem.request_type": intent}]
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to update ticket {ado_ticket_id}/{servicenow_sys_id} for intent {intent}: {str(e)}")
-                    raise ValueError(f"Ticket update failed: {str(e)}")
-
-                await broadcast({
-                    "type": "action_performed",
-                    "email_id": email_id,
-                    "ado_ticket_id": ado_ticket_id,
-                    "servicenow_sys_id": servicenow_sys_id,
-                    "success": action_result["success"],
-                    "message": action_details["message"],
-                    "thread_id": thread_id
-                })
-
-                updated_ticket = self.tickets_collection.find_one({"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id})
-                all_completed = await self.are_all_actions_completed(updated_ticket)
-                ado_status = "Done" if all_completed else "Doing"
-                servicenow_state = "Resolved" if all_completed else "In Progress"
-                try:
-                    await self.kernel.invoke(
-                        self.kernel.plugins["ado"]["update_ticket"],
-                        ticket_id=ado_ticket_id,
-                        status=ado_status,
-                        comment=action_result["message"]
-                    )
-                    await self.kernel.invoke(
-                        self.kernel.plugins["servicenow"]["update_ticket"],
-                        ticket_id=servicenow_sys_id,
-                        state=servicenow_state,
-                        comment=action_result["message"]
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to update tickets {ado_ticket_id}/{servicenow_sys_id}: {str(e)}")
-                    raise ValueError(f"Ticket update failed: {str(e)}")
-
-                # Send email reply for follow-up actionable intent
-                email_response = f"Your request to {intent.replace('_', ' ')} has been processed.\nStatus: {action_details['status']}\nDetails: {action_details['message']}"
-                if intent == "aws_ec2_launch_instance" and action_result.get("logs"):
-                    email_response += f"\n\nEC2 Execution Logs:\n{action_result['logs']}"
-                combined_body = f"Dear {sender_username},\n\n{email_response}\n\nBest regards,\nIT Support Agent"
-
-                reply_result = await self.kernel.invoke(
-                    self.kernel.plugins["email_sender"]["send_reply"],
-                    to=sender,
-                    subject=subject,
-                    body=combined_body,
-                    thread_id=thread_id,
-                    message_id=email_id,
-                    attachments=attachments,
-                    remediation=""
+            # Process follow-up email
+            if is_follow_up:
+                result = await self._process_follow_up_email(
+                    intent, sub_intents, details, email, existing_ticket, ado_ticket_id, servicenow_sys_id,
+                    completed_actions, pending_actions, monitor_task, broadcast
                 )
-                reply = reply_result.value if reply_result else None
+                result["ticket_status"] = ticket_status
+                return result
 
-                if reply:
-                    email_chain_entry = {
-                        "email_id": reply.get("message_id", str(uuid.uuid4())),
-                        "from": os.getenv('EMAIL_ADDRESS', 'IT Support <support@quadranttechnologies.com>'),
-                        "subject": subject,
-                        "body": combined_body,
-                        "timestamp": datetime.now().isoformat(),
-                        "attachments": []
-                    }
-                    self.tickets_collection.update_one(
-                        {"thread_id": thread_id},
-                        {"$push": {"email_chain": email_chain_entry}}
-                    )
-                    # Update Milvus with the latest ticket data
-                    updated_ticket = self.tickets_collection.find_one({"thread_id": thread_id})
-                    if updated_ticket:
-                        await self.send_to_milvus(updated_ticket)
-                    await broadcast({
-                        "type": "email_reply",
-                        "email_id": email_id,
-                        "thread_id": thread_id,
-                        "ado_ticket_id": ado_ticket_id,
-                        "servicenow_sys_id": servicenow_sys_id,
-                        "message": f"Sent response for {intent.replace('_', ' ')} request: {action_details['status']} - {action_details['message']}",
-                        "timestamp": datetime.now().isoformat()
-                    })
-
-                # Update Milvus with the latest ticket data
-                await self.send_to_milvus(updated_ticket)
-
-            # Handle git_and_aws_intent for follow-up
-            elif is_follow_up and intent == "git_and_aws_intent":
-                ado_ticket_id = existing_ticket["ado_ticket_id"]
-                servicenow_sys_id = existing_ticket["servicenow_sys_id"]
-                email_responses = []
-                for sub_intent in sub_intents:
-                    sub_intent_name = sub_intent["intent"]
-                    sub_action_details = {
-                        "request_type": sub_intent_name,
-                        "status": "pending",
-                        "message": f"Processing {sub_intent_name}"
-                    }
-                    if sub_intent_name == "github_create_repo":
-                        sub_action_details.update({
-                            "repo_name": details["repo_name"],
-                            "username": details["github_username"]
-                        })
-                    elif sub_intent_name == "github_commit_file":
-                        sub_action_details.update({
-                            "repo_name": details["repo_name"],
-                            "file_name": details["file_name"],
-                            "file_content": details["file_content"]
-                        })
-                    elif sub_intent_name == "github_delete_repo":
-                        sub_action_details.update({
-                            "repo_name": details["repo_name"]
-                        })
-                    elif sub_intent_name == "aws_s3_create_bucket":
-                        sub_action_details.update({
-                            "bucket_name": details["bucket_name"],
-                            "region": details["region"],
-                            "acl": details["acl"]
-                        })
-                    elif sub_intent_name == "aws_s3_delete_bucket":
-                        sub_action_details.update({
-                            "bucket_name": details["bucket_name"],
-                            "region": details["region"]
-                        })
-                    elif sub_intent_name == "aws_ec2_launch_instance":
-                        sub_action_details.update({
-                            "instance_type": details["instance_type"],
-                            "ami_id": details["ami_id"],
-                            "region": details["region"],
-                            "repo_name": details["repo_name"],
-                            "script_name": details["script_name"],
-                            "source_bucket": details["source_bucket"],
-                            "destination_bucket": details["destination_bucket"],
-                            "logs": ""
-                        })
-                    elif sub_intent_name == "aws_ec2_terminate_instance":
-                        sub_action_details.update({
-                            "instance_id": details["instance_id"],
-                            "region": details["region"]
-                        })
-
-                    update_operation = {
-                        "$push": {
-                            "details.aws" if sub_intent_name.startswith("aws_") else "details.github": sub_action_details,
-                            "updates": {
-                                "status": "Doing",
-                                "comment": sub_action_details["message"],
-                                "revision_id": f"{sub_intent_name.split('_')[1]}-{ado_ticket_id}-{len(existing_ticket.get('updates', [])) + 1}",
-                                "email_sent": False,
-                                "email_message_id": None,
-                                "email_timestamp": datetime.now().isoformat()
-                            }
-                        },
-                        "$set": {
-                            "pending_actions": pending_actions
-                        }
-                    }
-                    try:
-                        self.tickets_collection.update_one({"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id}, update_operation)
-                    except Exception as e:
-                        logger.error(f"Failed to update ticket {ado_ticket_id}/{servicenow_sys_id} for sub-intent {sub_intent_name}: {str(e)}")
-                        raise ValueError(f"Ticket update failed: {str(e)}")
-
-                    sub_action_result = await self.perform_action(sub_intent_name, details, broadcast=broadcast, email_id=email_id, thread_id=thread_id)
-                    sub_action_details["status"] = sub_action_result.get("status", "failed")
-                    sub_action_details["message"] = sub_action_result["message"]
-                    if sub_intent_name == "aws_ec2_launch_instance" and sub_action_result.get("logs"):
-                        sub_action_details["logs"] = sub_action_result["logs"]
-                    completed_actions.append({"action": sub_intent_name, "completed": sub_action_result["success"]})
-
-                    # Collect email response for each sub-intent
-                    sub_email_response = f"Sub-request to {sub_intent_name.replace('_', ' ')}:\nStatus: {sub_action_details['status']}\nDetails: {sub_action_details['message']}"
-                    if sub_intent_name == "aws_ec2_launch_instance" and sub_action_result.get("logs"):
-                        sub_email_response += f"\n\nEC2 Execution Logs:\n{sub_action_result['logs']}"
-                    email_responses.append(sub_email_response)
-
-                    if sub_intent_name == "aws_ec2_run_script" and not sub_action_result["success"]:
-                        await broadcast({
-                            "type": "script_execution_failed",
-                            "email_id": email_id,
-                            "ado_ticket_id": ado_ticket_id,
-                            "servicenow_sys_id": servicenow_sys_id,
-                            "success": False,
-                            "message": sub_action_result["message"],
-                            "thread_id": thread_id
-                        })
-
-                    if sub_intent_name in ["aws_ec2_run_script", "aws_ec2_launch_instance"] and sub_action_result.get("permission_fixed"):
-                        await broadcast({
-                            "type": "permission_fixed",
-                            "email_id": email_id,
-                            "ado_ticket_id": ado_ticket_id,
-                            "servicenow_sys_id": servicenow_sys_id,
-                            "message": sub_action_result.get("permission_message", "Permission issue fixed"),
-                            "thread_id": thread_id
-                        })
-
-                    if sub_intent_name in completion_intents and sub_action_result["success"]:
-                        pending_actions = False
-                        logger.info(f"Completion sub-intent {sub_intent_name} processed successfully for ticket ID={ado_ticket_id}/{servicenow_sys_id}. Setting pending_actions to False.")
-
-                    update_operation = {
-                        "$set": {
-                            f"details.{'aws' if sub_intent_name.startswith('aws_') else 'github'}.$[elem].status": sub_action_details["status"],
-                            f"details.{'aws' if sub_intent_name.startswith('aws_') else 'github'}.$[elem].message": sub_action_details["message"],
-                            "pending_actions": pending_actions
-                        }
-                    }
-                    if sub_intent_name == "aws_ec2_launch_instance" and sub_action_result.get("logs"):
-                        update_operation["$set"][f"details.aws.$[elem].logs"] = sub_action_details["logs"]
-                    try:
-                        self.tickets_collection.update_one(
-                            {"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id},
-                            update_operation,
-                            array_filters=[{"elem.request_type": sub_intent_name}]
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to update ticket {ado_ticket_id}/{servicenow_sys_id} for sub-intent result {sub_intent_name}: {str(e)}")
-                        raise ValueError(f"Ticket update failed: {str(e)}")
-
-                    await broadcast({
-                        "type": "action_performed",
-                        "email_id": email_id,
-                        "ado_ticket_id": ado_ticket_id,
-                        "servicenow_sys_id": servicenow_sys_id,
-                        "success": sub_action_result["success"],
-                        "message": sub_action_details["message"],
-                        "thread_id": thread_id
-                    })
-
-                updated_ticket = self.tickets_collection.find_one({"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id})
-                all_completed = await self.are_all_actions_completed(updated_ticket)
-                ado_status = "Done" if all_completed else "Doing"
-                servicenow_state = "Resolved" if all_completed else "In Progress"
-                try:
-                    await self.kernel.invoke(
-                        self.kernel.plugins["ado"]["update_ticket"],
-                        ticket_id=ado_ticket_id,
-                        status=ado_status,
-                        comment="Processed combined GitHub and AWS actions"
-                    )
-                    await self.kernel.invoke(
-                        self.kernel.plugins["servicenow"]["update_ticket"],
-                        ticket_id=servicenow_sys_id,
-                        state=servicenow_state,
-                        comment="Processed combined GitHub and AWS actions"
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to update tickets {ado_ticket_id}/{servicenow_sys_id}: {str(e)}")
-                    raise ValueError(f"Ticket update failed: {str(e)}")
-
-                # Send email reply for git_and_aws_intent follow-up
-                email_response = "\n\n".join(email_responses)
-                combined_body = f"Dear {sender_username},\n\nYour combined GitHub and AWS requests have been processed:\n\n{email_response}\n\nBest regards,\nIT Support Agent"
-
-                reply_result = await self.kernel.invoke(
-                    self.kernel.plugins["email_sender"]["send_reply"],
-                    to=sender,
-                    subject=subject,
-                    body=combined_body,
-                    thread_id=thread_id,
-                    message_id=email_id,
-                    attachments=attachments,
-                    remediation=""
-                )
-                reply = reply_result.value if reply_result else None
-
-                if reply:
-                    email_chain_entry = {
-                        "email_id": reply.get("message_id", str(uuid.uuid4())),
-                        "from": os.getenv('EMAIL_ADDRESS', 'IT Support <support@quadranttechnologies.com>'),
-                        "subject": subject,
-                        "body": combined_body,
-                        "timestamp": datetime.now().isoformat(),
-                        "attachments": []
-                    }
-                    self.tickets_collection.update_one(
-                        {"thread_id": thread_id},
-                        {"$push": {"email_chain": email_chain_entry}}
-                    )
-                    # Update Milvus with the latest ticket data
-                    updated_ticket = self.tickets_collection.find_one({"thread_id": thread_id})
-                    if updated_ticket:
-                        await self.send_to_milvus(updated_ticket)
-                    await broadcast({
-                        "type": "email_reply",
-                        "email_id": email_id,
-                        "thread_id": thread_id,
-                        "ado_ticket_id": ado_ticket_id,
-                        "servicenow_sys_id": servicenow_sys_id,
-                        "message": f"Sent response for combined GitHub and AWS requests: processed {len(sub_intents)} sub-intents",
-                        "timestamp": datetime.now().isoformat()
-                    })
-
-                # Update Milvus with the latest ticket data
-                await self.send_to_milvus(updated_ticket)
-
-            # Handle new email
-            else:
-                # Create ADO ticket
-                ado_ticket_result = await self.kernel.invoke(
-                    self.kernel.plugins["ado"]["create_ticket"],
-                    title=subject,
-                    description=ticket_description,
-                    email_content=email_content,
-                    attachments=attachments
-                )
-                if not ado_ticket_result or not ado_ticket_result.value:
-                    logger.error(f"Failed to create ADO ticket for email ID={email_id}")
-                    if monitor_task:
-                        await self.stop_monitoring(details["instance_id"])
-                        await broadcast({
-                            "type": "monitoring_stopped",
-                            "email_id": email_id,
-                            "instance_id": details["instance_id"],
-                            "message": f"Stopped CloudWatch monitoring for instance {details['instance_id']}",
-                            "thread_id": thread_id
-                        })
-                    return {"status": "error", "message": "ADO ticket creation failed", "actions": [], "pending_actions": False}
-
-                ado_ticket_data = ado_ticket_result.value
-                ado_ticket_id = ado_ticket_data["id"]
-                ado_url = ado_ticket_data["url"]
-
-                # Create ServiceNow ticket
-                servicenow_ticket_result = await self.kernel.invoke(
-                    self.kernel.plugins["servicenow"]["create_ticket"],
-                    title=subject,
-                    description=ticket_description,
-                    email_content=email_content,
-                    attachments=[a for a in attachments if isinstance(a, dict) and "path" in a and "filename" in a]
-                )
-                if not servicenow_ticket_result or not servicenow_ticket_result.value:
-                    logger.error(f"Failed to create ServiceNow ticket for email ID={email_id}")
-                    # Still proceed with ADO ticket if ServiceNow fails
-                    servicenow_sys_id = None
-                    servicenow_url = None
-                else:
-                    servicenow_ticket_data = servicenow_ticket_result.value
-                    servicenow_sys_id = servicenow_ticket_data["sys_id"]
-                    servicenow_url = servicenow_ticket_data["url"]
-
-                await broadcast({
-                    "type": "ticket_created",
-                    "email_id": email_id,
-                    "ado_ticket_id": ado_ticket_id,
-                    "servicenow_sys_id": servicenow_sys_id,
-                    "ado_url": ado_url,
-                    "servicenow_url": servicenow_url,
-                    "intent": intent,
-                    "thread_id": thread_id
-                })
-
-                # Clean email body for comments
-                cleaned_comments = BeautifulSoup(body, "html.parser").get_text().strip() if "<html>" in body.lower() else body.strip()
-
-                # Initialize remediation for general_it_request
-                remediation = ""
-
-                # Handle general_it_request with Milvus search
-                if intent == "general_it_request":
-                    # Search Milvus for similar tickets
-                    has_matches, matching_ticket = await self.search_milvus_for_solution(subject, ticket_description, cleaned_comments)
-                    ticket_record = {
-                        "ado_ticket_id": ado_ticket_id,
-                        "servicenow_sys_id": servicenow_sys_id,
-                        "sender": sender,
-                        "subject": subject,
-                        "thread_id": thread_id,
-                        "email_id": email_id,
-                        "ticket_title": subject,
-                        "ticket_description": ticket_description,
-                        "email_timestamp": datetime.now().isoformat(),
-                        "updates": [{
-                            "status": "New",
-                            "comment": cleaned_comments,
-                            "revision_id": f"initial-{ado_ticket_id}-1",
-                            "email_sent": False,
-                            "email_message_id": None,
-                            "email_timestamp": datetime.now().isoformat()
-                        }],
-                        "email_chain": [{
-                            "email_id": email_id,
-                            "from": sender,
-                            "subject": subject,
-                            "body": body,
-                            "timestamp": email.get("received", datetime.now().isoformat()),
-                            "attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]
-                        }],
-                        "pending_actions": pending_actions,
-                        "type_of_request": intent,
-                        "details": {"attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]},
-                        "in_milvus": has_matches
-                    }
-
-                    if has_matches:
-                        # Extract and restructure remediation from matching ticket
-                        remediation = await self.restructure_remediation_from_milvus(matching_ticket, sender_username)
-                        ticket_record["remediation"] = remediation
-                    else:
-                        # Store ticket in Milvus if no match found
-                        await self.send_to_milvus(ticket_record)
-
-                    # Update ticket description for general_it_request
-                    detailed_description = f"User {sender_username}: {ticket_description}"
-                    ticket_record["details"]["general"] = [{
-                        "request_type": "general_it_request",
-                        "status": "pending",
-                        "message": detailed_description,
-                        "requester": sender_username
-                    }]
-                    ticket_record["ticket_description"] = detailed_description
-
-                    # Store ticket in MongoDB
-                    try:
-                        self.tickets_collection.insert_one(ticket_record)
-                    except Exception as e:
-                        logger.error(f"Failed to insert ticket record for tickets {ado_ticket_id}/{servicenow_sys_id}: {str(e)}")
-                        raise ValueError(f"Ticket insertion failed: {str(e)}")
-
-                # Perform action for single intent
-                elif intent != "git_and_aws_intent":
-                    action_result = await self.perform_action(intent, details, broadcast=broadcast, email_id=email_id, thread_id=thread_id)
-                    action_details = {
-                        "request_type": intent,
-                        "status": action_result.get("status", "failed"),
-                        "message": action_result["message"]
-                    }
-                    if intent.startswith("github_"):
-                        action_details.update({
-                            "repo_name": details["repo_name"],
-                            "username": details["github_username"],
-                            "access_type": details["access_type"] if intent == "github_access_request" else "unspecified",
-                            "file_name": details["file_name"] if intent == "github_commit_file" else "unspecified",
-                            "file_content": details["file_content"] if intent == "github_commit_file" else ""
-                        })
-                    elif intent.startswith("aws_s3_"):
-                        action_details.update({
-                            "bucket_name": details["bucket_name"],
-                            "region": details["region"],
-                            "acl": details["acl"] if intent == "aws_s3_create_bucket" else "unspecified"
-                        })
-                    elif intent.startswith("aws_ec2_"):
-                        action_details.update({
-                            "instance_type": details["instance_type"],
-                            "ami_id": details["ami_id"],
-                            "instance_id": action_result.get("instance_id", details["instance_id"]),
-                            "region": details["region"],
-                            "repo_name": details["repo_name"],
-                            "script_name": details["script_name"],
-                            "source_bucket": details["source_bucket"],
-                            "destination_bucket": details["destination_bucket"],
-                            "logs": action_result.get("logs", "") if intent == "aws_ec2_launch_instance" else ""
-                        })
-                    elif intent.startswith("aws_iam_"):
-                        action_details.update({
-                            "username": details["username"],
-                            "permission": details["permission"] if "permission" in intent else "unspecified"
-                        })
-                    completed_actions.append({"action": intent, "completed": action_result["success"]})
-
-                    if intent == "aws_ec2_run_script" and not action_result["success"]:
-                        await broadcast({
-                            "type": "script_execution_failed",
-                            "email_id": email_id,
-                            "ado_ticket_id": ado_ticket_id,
-                            "servicenow_sys_id": servicenow_sys_id,
-                            "success": False,
-                            "message": action_result["message"],
-                            "thread_id": thread_id
-                        })
-
-                    if intent in ["aws_ec2_run_script", "aws_ec2_launch_instance"] and action_result.get("permission_fixed"):
-                        await broadcast({
-                            "type": "permission_fixed",
-                            "email_id": email_id,
-                            "ado_ticket_id": ado_ticket_id,
-                            "servicenow_sys_id": servicenow_sys_id,
-                            "message": action_result.get("permission_message", "Permission issue fixed"),
-                            "thread_id": thread_id
-                        })
-
-                    try:
-                        await self.kernel.invoke(
-                            self.kernel.plugins["ado"]["update_ticket"],
-                            ticket_id=ado_ticket_id,
-                            status="Doing" if pending_actions else "Done",
-                            comment=action_result["message"]
-                        )
-                        if servicenow_sys_id:
-                            await self.kernel.invoke(
-                                self.kernel.plugins["servicenow"]["update_ticket"],
-                                ticket_id=servicenow_sys_id,
-                                state="In Progress" if pending_actions else "Resolved",
-                                comment=action_result["message"]
-                            )
-                    except Exception as e:
-                        logger.error(f"Failed to update tickets {ado_ticket_id}/{servicenow_sys_id}: {str(e)}")
-                        raise ValueError(f"Ticket update failed: {str(e)}")
-
-                    await broadcast({
-                        "type": "action_performed",
-                        "email_id": email_id,
-                        "ado_ticket_id": ado_ticket_id,
-                        "servicenow_sys_id": servicenow_sys_id,
-                        "success": action_result["success"],
-                        "message": action_details["message"],
-                        "thread_id": thread_id
-                    })
-
-                # Handle git_and_aws_intent for new email
-                elif intent == "git_and_aws_intent":
-                    for sub_intent in sub_intents:
-                        sub_intent_name = sub_intent["intent"]
-                        sub_action_result = await self.perform_action(sub_intent_name, details, broadcast=broadcast, email_id=email_id, thread_id=thread_id)
-                        sub_action_details = {
-                            "request_type": sub_intent_name,
-                            "status": sub_action_result.get("status", "failed"),
-                            "message": sub_action_result["message"]
-                        }
-                        if sub_intent_name == "github_create_repo":
-                            sub_action_details.update({
-                                "repo_name": details["repo_name"],
-                                "username": details["github_username"]
-                            })
-                        elif sub_intent_name == "github_commit_file":
-                            sub_action_details.update({
-                                "repo_name": details["repo_name"],
-                                "file_name": details["file_name"],
-                                "file_content": details["file_content"]
-                            })
-                        elif sub_intent_name == "github_delete_repo":
-                            sub_action_details.update({
-                                "repo_name": details["repo_name"]
-                            })
-                        elif sub_intent_name == "aws_s3_create_bucket":
-                            sub_action_details.update({
-                                "bucket_name": details["bucket_name"],
-                                "region": details["region"],
-                                "acl": details["acl"]
-                            })
-                        elif sub_intent_name == "aws_s3_delete_bucket":
-                            sub_action_details.update({
-                                "bucket_name": details["bucket_name"],
-                                "region": details["region"]
-                            })
-                        elif sub_intent_name == "aws_ec2_launch_instance":
-                            sub_action_details.update({
-                                "instance_type": details["instance_type"],
-                                "ami_id": details["ami_id"],
-                                "region": details["region"],
-                                "repo_name": details["repo_name"],
-                                "script_name": details["script_name"],
-                                "source_bucket": details["source_bucket"],
-                                "destination_bucket": details["destination_bucket"],
-                                "logs": sub_action_result.get("logs", ""),
-                                "instance_id": sub_action_result.get("instance_id", "unspecified")
-                            })
-                        elif sub_intent_name == "aws_ec2_terminate_instance":
-                            sub_action_details.update({
-                                "instance_id": details["instance_id"],
-                                "region": details["region"]
-                            })
-                        completed_actions.append({"action": sub_intent_name, "completed": sub_action_result["success"]})
-
-                        if sub_intent_name == "aws_ec2_run_script" and not sub_action_result["success"]:
-                            await broadcast({
-                                "type": "script_execution_failed",
-                                "email_id": email_id,
-                                "ado_ticket_id": ado_ticket_id,
-                                "servicenow_sys_id": servicenow_sys_id,
-                                "success": False,
-                                "message": sub_action_result["message"],
-                                "thread_id": thread_id
-                            })
-
-                        if sub_intent_name in ["aws_ec2_run_script", "aws_ec2_launch_instance"] and sub_action_result.get("permission_fixed"):
-                            await broadcast({
-                                "type": "permission_fixed",
-                                "email_id": email_id,
-                                "ado_ticket_id": ado_ticket_id,
-                                "servicenow_sys_id": servicenow_sys_id,
-                                "message": sub_action_result.get("permission_message", "Permission issue fixed"),
-                                "thread_id": thread_id
-                            })
-
-                        try:
-                            self.tickets_collection.update_one(
-                                {"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id},
-                                {
-                                    "$push": {
-                                        f"details.{'aws' if sub_intent_name.startswith('aws_') else 'github'}": sub_action_details,
-                                        "updates": {
-                                            "status": "Doing",
-                                            "comment": sub_action_result["message"],
-                                            "revision_id": f"{sub_intent_name.split('_')[1]}-{ado_ticket_id}-{len(completed_actions)}",
-                                            "email_sent": False,
-                                            "email_message_id": None,
-                                            "email_timestamp": datetime.now().isoformat()
-                                        }
-                                    }
-                                }
-                            )
-                        except Exception as e:
-                            logger.error(f"Failed to update ticket {ado_ticket_id}/{servicenow_sys_id} for sub-intent {sub_intent_name}: {str(e)}")
-                            raise ValueError(f"Ticket update failed: {str(e)}")
-
-                        await broadcast({
-                            "type": "action_performed",
-                            "email_id": email_id,
-                            "ado_ticket_id": ado_ticket_id,
-                            "servicenow_sys_id": servicenow_sys_id,
-                            "success": sub_action_result["success"],
-                            "message": sub_action_details["message"],
-                            "thread_id": thread_id
-                        })
-
-                # Update ticket in MongoDB (for non-general_it_request intents)
-                if intent != "general_it_request":
-                    ticket_record = {
-                        "ado_ticket_id": ado_ticket_id,
-                        "servicenow_sys_id": servicenow_sys_id,
-                        "sender": sender,
-                        "subject": subject,
-                        "thread_id": thread_id,
-                        "email_id": email_id,
-                        "ticket_title": subject,
-                        "ticket_description": ticket_description,
-                        "email_timestamp": datetime.now().isoformat(),
-                        "updates": [],
-                        "email_chain": [{
-                            "email_id": email_id,
-                            "from": sender,
-                            "subject": subject,
-                            "body": body,
-                            "timestamp": email.get("received", datetime.now().isoformat()),
-                            "attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]
-                        }],
-                        "pending_actions": pending_actions,
-                        "type_of_request": intent,
-                        "details": {"attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]},
-                        "in_milvus": False
-                    }
-                    if action_details:
-                        ticket_record["details"]["aws" if intent.startswith("aws_") else "github"] = [action_details]
-                    elif intent == "git_and_aws_intent":
-                        ticket_record["details"]["github"] = [
-                            d for d in completed_actions if d["action"].startswith("github_")
-                        ]
-                        ticket_record["details"]["aws"] = [
-                            d for d in completed_actions if d["action"].startswith("aws_")
-                        ]
-                    try:
-                        self.tickets_collection.insert_one(ticket_record)
-                    except Exception as e:
-                        logger.error(f"Failed to insert ticket record for tickets {ado_ticket_id}/{servicenow_sys_id}: {str(e)}")
-                        raise ValueError(f"Ticket insertion failed: {str(e)}")
-
-                # Send ticket to Milvus for non-general_it_request intents
-                if intent != "general_it_request":
-                    ticket_record = self.tickets_collection.find_one({"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id})
-                    await self.send_to_milvus(ticket_record)
-
-                if intent != "general_it_request":
-                    updated_ticket = self.tickets_collection.find_one({"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id})
-                    all_completed = await self.are_all_actions_completed(updated_ticket)
-                    ado_status = "Done" if all_completed else "Doing"
-                    servicenow_state = "Resolved" if all_completed else "In Progress"
-
-                    try:
-                        await self.kernel.invoke(
-                            self.kernel.plugins["ado"]["update_ticket"],
-                            ticket_id=ado_ticket_id,
-                            status=ado_status,
-                            comment=action_result["message"] if action_result else "Processed request"
-                        )
-                        if servicenow_sys_id:
-                            await self.kernel.invoke(
-                                self.kernel.plugins["servicenow"]["update_ticket"],
-                                ticket_id=servicenow_sys_id,
-                                state=servicenow_state,
-                                comment=action_result["message"] if action_result else "Processed request"
-                            )
-                    except Exception as e:
-                        logger.error(f"Failed to update tickets {ado_ticket_id}/{servicenow_sys_id}: {str(e)}")
-                        raise ValueError(f"Ticket update failed: {str(e)}")
-
-                if servicenow_sys_id:
-                    try:
-                        servicenow_updates_result = await self.kernel.invoke(
-                            self.kernel.plugins["servicenow"]["get_ticket_updates"],
-                            ticket_id=servicenow_sys_id
-                        )
-                        servicenow_updates = servicenow_updates_result.value if servicenow_updates_result else []
-                    except Exception as e:
-                        logger.error(f"Failed to fetch ServiceNow updates for sys_id={servicenow_sys_id}: {str(e)}")
-                        servicenow_updates = []
-                        await broadcast({
-                            "type": "error",
-                            "email_id": email_id,
-                            "message": f"Failed to fetch ServiceNow updates: {str(e)}",
-                            "thread_id": thread_id
-                        })
-                else:
-                    logger.warning(f"No ServiceNow sys_id provided for email ID={email_id}")
-                    servicenow_updates = []
-                    await broadcast({
-                        "type": "error",
-                        "email_id": email_id,
-                        "message": "No ServiceNow sys_id available for update fetching",
-                        "thread_id": thread_id
-                    })
-
-                # Analyze ticket updates
-                try:
-                    update_result = await self.analyze_ticket_update(servicenow_sys_id, servicenow_updates, attachments)
-                    email_response = update_result.get("email_response", "No updates available.")
-                    existing_remediation = update_result.get("remediation", "")
-                except Exception as e:
-                    logger.error(f"Error analyzing ticket update for sys_id={servicenow_sys_id}: {str(e)}")
-                    email_response = "Unable to process ticket updates at this time."
-                    existing_remediation = ""
-                    await broadcast({
-                        "type": "error",
-                        "email_id": email_id,
-                        "message": f"Failed to analyze ticket updates: {str(e)}",
-                        "thread_id": thread_id
-                    })
-
-                # Combine remediation from Milvus with existing remediation
-                combined_remediation = existing_remediation
-                if remediation:
-                    combined_remediation = (
-                        f"{existing_remediation}\n\n**While we work on resolving your issue, you can try these remediation steps retrieved from the knowledge base articles:**\n\n{remediation}"
-                        if existing_remediation else
-                        f"**While we work on resolving your issue, you can try these remediation steps retrieved from the knowledge base articles:**\n\n{remediation}"
-                    )
-
-                if intent == "git_and_aws_intent" or intent == "aws_ec2_launch_instance":
-                    ticket_record = self.tickets_collection.find_one({"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id})
-                    ec2_actions = [
-                        action for action in ticket_record.get("details", {}).get("aws", [])
-                        if action["request_type"] == "aws_ec2_launch_instance" and action.get("logs")
-                    ]
-                    if ec2_actions:
-                        logs = ec2_actions[-1]["logs"]
-                        email_response += f"\n\nEC2 Execution Logs:\n{logs}"
-
-                # Combine email_response and remediation, add greeting and signature
-                combined_body = f"Dear {sender_username},\n\n{email_response}"
-                if combined_remediation:
-                    combined_body += f"\n\n{combined_remediation}"
-                combined_body += "\n\nBest regards,\nIT Support Agent"
-
-                reply_result = await self.kernel.invoke(
-                    self.kernel.plugins["email_sender"]["send_reply"],
-                    to=sender,
-                    subject=subject,
-                    body=combined_body,
-                    thread_id=thread_id,
-                    message_id=email_id,
-                    attachments=attachments,
-                    remediation=""
-                )
-                reply = reply_result.value if reply_result else None
-
-                if reply:
-                    email_chain_entry = {
-                        "email_id": reply.get("message_id", str(uuid.uuid4())),
-                        "from": os.getenv('EMAIL_ADDRESS', 'IT Support <support@quadranttechnologies.com>'),
-                        "subject": subject,
-                        "body": combined_body,
-                        "timestamp": datetime.now().isoformat(),
-                        "attachments": []
-                    }
-                    try:
-                        self.tickets_collection.update_one(
-                            {"thread_id": thread_id},
-                            {"$push": {"email_chain": email_chain_entry}}
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to update email chain for tickets {ado_ticket_id}/{servicenow_sys_id}: {str(e)}")
-                        raise ValueError(f"Email chain update failed: {str(e)}")
-
-                    # Update Milvus after email chain update
-                    updated_ticket = self.tickets_collection.find_one({"thread_id": thread_id})
-                    if updated_ticket:
-                        await self.send_to_milvus(updated_ticket)
-
-                    await broadcast({
-                        "type": "email_reply",
-                        "email_id": email_id,
-                        "thread_id": thread_id,
-                        "ado_ticket_id": ado_ticket_id,
-                        "servicenow_sys_id": servicenow_sys_id,
-                        "message": f"Sent response for {intent.replace('_', ' ')} request: ticket created and processed",
-                        "timestamp": datetime.now().isoformat()
-                    })
-
-                    if monitor_task and intent != "general_it_request":
-                        await self.stop_monitoring(details["instance_id"])
-                        await broadcast({
-                            "type": "monitoring_stopped",
-                            "email_id": email_id,
-                            "instance_id": details["instance_id"],
-                            "message": f"Stopped CloudWatch monitoring for instance {details['instance_id']}",
-                            "thread_id": thread_id
-                        })
-
-                    return {
-                        "status": "success",
-                        "ado_ticket_id": ado_ticket_id,
-                        "servicenow_sys_id": servicenow_sys_id,
-                        "intent": intent,
-                        "actions": completed_actions,
-                        "pending_actions": pending_actions
-                    }
-
-            if monitor_task:
-                await self.stop_monitoring(details["instance_id"])
-                await broadcast({
-                    "type": "monitoring_stopped",
-                    "email_id": email_id,
-                    "instance_id": details["instance_id"],
-                    "message": f"Stopped CloudWatch monitoring for instance {details['instance_id']}",
-                    "thread_id": thread_id
-                })
-
-            return {
-                "status": "success",
-                "ado_ticket_id": ado_ticket_id,
-                "servicenow_sys_id": servicenow_sys_id,
-                "intent": intent,
-                "actions": completed_actions,
-                "pending_actions": pending_actions
-            }
+            # Process new email
+            result = await self._process_new_email(
+                intent, sub_intents, details, email, ticket_description, email_content, attachments,
+                sender, thread_id, email_id, subject, body, completed_actions, pending_actions,
+                monitor_task, broadcast
+            )
+            result["ticket_status"] = ticket_status
+            return result
 
         except Exception as e:
             logger.error(f"Error processing email ID={email_id}: {str(e)}")
@@ -2312,12 +1192,6 @@ class SKAgent:
                     "message": f"Stopped CloudWatch monitoring for instance {details['instance_id']}",
                     "thread_id": thread_id
                 })
-            await broadcast({
-                "type": "error",
-                "email_id": email_id,
-                "message": str(e),
-                "thread_id": thread_id
-            })
             return {
                 "status": "error",
                 "intent": intent or "unknown",
@@ -2325,8 +1199,1057 @@ class SKAgent:
                 "servicenow_sys_id": servicenow_sys_id,
                 "message": f"Failed to process email: {str(e)}",
                 "actions": completed_actions,
-                "pending_actions": pending_actions
+                "pending_actions": pending_actions,
+                "ticket_status": ticket_status
             }
+
+    async def _analyze_and_extract(self, email: dict, existing_ticket: dict) -> tuple:
+        """Analyze email intent and extract relevant details."""
+        subject = email["subject"]
+        body = email["body"]
+        attachments = email.get("attachments", [])
+
+        # Analyze intent
+        intent_result = await self.analyze_intent(subject, body, attachments)
+
+        # Extract details
+        details = {
+            "repo_name": intent_result.get("repo_name", "unspecified"),
+            "access_type": intent_result.get("access_type", "unspecified"),
+            "github_username": intent_result.get("github_username", "unspecified"),
+            "bucket_name": intent_result.get("bucket_name", "unspecified"),
+            "region": intent_result.get("region", "us-east-1"),
+            "acl": intent_result.get("acl", "unspecified"),
+            "instance_type": intent_result.get("instance_type", "unspecified"),
+            "ami_id": intent_result.get("ami_id", "unspecified"),
+            "instance_id": intent_result.get("instance_id", "unspecified"),
+            "username": intent_result.get("username", "unspecified"),
+            "permission": intent_result.get("permission", "unspecified"),
+            "file_name": intent_result.get("file_name", "unspecified"),
+            "source_bucket": intent_result.get("source_bucket", "unspecified"),
+            "destination_bucket": intent_result.get("destination_bucket", "unspecified"),
+            "script_name": intent_result.get("script_name", "unspecified"),
+            "file_content": intent_result.get("file_content", ""),
+            "enable_cloudwatch_monitoring": intent_result.get("enable_cloudwatch_monitoring", False),
+            "log_group_name": intent_result.get("log_group_name", "EC2logs"),
+            "monitor_interval": intent_result.get("monitor_interval", 5)
+        }
+
+        return intent_result, details
+
+    async def _start_monitoring_if_needed(self, intent: str, enable_cloudwatch_monitoring: bool, details: dict,
+                                         email_id: str, thread_id: str, broadcast) -> asyncio.Task:
+        """Start CloudWatch monitoring for applicable intents."""
+        monitor_task = None
+        if (intent in ["git_and_aws_intent", "aws_ec2_run_script"] and
+                enable_cloudwatch_monitoring and
+                details["instance_id"] != "unspecified"):
+            logger.debug(f"Monitor plugin available: {'monitor' in self.kernel.plugins}")
+            if "monitor" in self.kernel.plugins:
+                logger.info(f"Starting CloudWatch monitoring for instance {details['instance_id']}")
+                try:
+                    monitor_task = asyncio.create_task(
+                        self.kernel.invoke(
+                            self.kernel.plugins["monitor"]["start_monitoring"],
+                            instance_id=details["instance_id"],
+                            log_group_name=details.get("log_group_name", "EC2logs"),
+                            interval=details.get("monitor_interval", 5),
+                            region=details["region"],
+                            email_id=email_id,
+                            broadcast=broadcast
+                        )
+                    )
+                    self.monitor_tasks[details["instance_id"]] = monitor_task
+                    logger.info(f"Monitoring task created for instance {details['instance_id']}")
+                    await broadcast({
+                        "type": "monitoring_started",
+                        "email_id": email_id,
+                        "instance_id": details["instance_id"],
+                        "message": f"Started CloudWatch monitoring for instance {details['instance_id']}",
+                        "thread_id": thread_id
+                    })
+                except Exception as e:
+                    logger.error(f"Failed to start monitoring for instance {details['instance_id']}: {str(e)}")
+                    await broadcast({
+                        "type": "error",
+                        "email_id": email_id,
+                        "message": f"Failed to start CloudWatch monitoring: {str(e)}",
+                        "thread_id": thread_id
+                    })
+            else:
+                logger.error("Monitor plugin not found")
+                await broadcast({
+                    "type": "error",
+                    "email_id": email_id,
+                    "message": "Monitor plugin not found for CloudWatch monitoring",
+                    "thread_id": thread_id
+                })
+        return monitor_task
+
+    async def _handle_special_intents(self, intent: str, email: dict, existing_ticket: dict, is_follow_up: bool,
+                                     monitor_task: asyncio.Task, details: dict, broadcast) -> dict:
+        """Handle non-intent and request summary emails."""
+        email_id = email["id"]
+        sender = email["from"]
+        subject = email["subject"]
+        body = email["body"]
+        thread_id = email.get("threadId", email_id)
+        attachments = email.get("attachments", [])
+
+        if intent == "non_intent":
+            if is_follow_up:
+                email_chain_entry = self._create_email_chain_entry(email)
+                self.tickets_collection.update_one(
+                    {"thread_id": thread_id},
+                    {"$push": {"email_chain": email_chain_entry}}
+                )
+                updated_ticket = self.tickets_collection.find_one({"thread_id": thread_id})
+                if updated_ticket:
+                    await self.send_to_milvus(updated_ticket)
+            else:
+                ticket_record = self._create_non_intent_ticket(email)
+                try:
+                    self.tickets_collection.insert_one(ticket_record)
+                except Exception as e:
+                    logger.error(f"Failed to insert non-intent ticket for email ID={email_id}: {str(e)}")
+                    await broadcast({
+                        "type": "error",
+                        "email_id": email_id,
+                        "message": f"Failed to store non-intent ticket: {str(e)}",
+                        "thread_id": thread_id
+                    })
+
+            if monitor_task:
+                await self._stop_monitoring(details["instance_id"], email_id, thread_id, broadcast)
+
+            return {
+                "status": "success",
+                "intent": "non_intent",
+                "ado_ticket_id": existing_ticket.get("ado_ticket_id") if is_follow_up and "ado" in self.platforms else None,
+                "servicenow_sys_id": existing_ticket.get("servicenow_sys_id") if is_follow_up and "servicenow" in self.platforms else None,
+                "message": "Non-intent email processed; no further action taken",
+                "actions": [],
+                "pending_actions": False
+            }
+
+        elif intent == "request_summary" and is_follow_up:
+            ticket_record = existing_ticket
+            summary_result = await self.generate_summary_response(ticket_record, f"Subject: {subject}\nBody: {body}")
+            email_response = summary_result["email_response"]
+
+            reply = await self._send_reply(
+                sender, subject, email_response, thread_id, email_id, attachments, "", broadcast
+            )
+            if reply:
+                email_chain_entry = self._create_reply_email_chain_entry(reply, subject, email_response)
+                self.tickets_collection.update_one(
+                    {"thread_id": thread_id},
+                    {"$push": {"email_chain": email_chain_entry}}
+                )
+                updated_ticket = self.tickets_collection.find_one({"thread_id": thread_id})
+                if updated_ticket:
+                    await self.send_to_milvus(updated_ticket)
+                await broadcast({
+                    "type": "email_reply",
+                    "email_id": email_id,
+                    "thread_id": thread_id,
+                    "ado_ticket_id": ticket_record.get("ado_ticket_id") if "ado" in self.platforms else None,
+                    "servicenow_sys_id": ticket_record.get("servicenow_sys_id") if "servicenow" in self.platforms else None,
+                    "message": f"Sent summary of ticket status for {'ADO ticket ' + ticket_record['ado_ticket_id'] if 'ado' in self.platforms and ticket_record.get('ado_ticket_id') else 'ServiceNow ticket ' + ticket_record['servicenow_sys_id']}",
+                    "timestamp": datetime.now().isoformat()
+                })
+
+            if monitor_task:
+                await self._stop_monitoring(details["instance_id"], email_id, thread_id, broadcast)
+
+            return {
+                "status": "success",
+                "ado_ticket_id": ticket_record.get("ado_ticket_id") if "ado" in self.platforms else None,
+                "servicenow_sys_id": ticket_record.get("servicenow_sys_id") if "servicenow" in self.platforms else None,
+                "intent": intent,
+                "summary_intent": summary_result["summary_intent"],
+                "actions": [],
+                "pending_actions": False
+            }
+
+    async def _process_follow_up_email(self, intent: str, sub_intents: list, details: dict, email: dict,
+                                  existing_ticket: dict, ado_ticket_id: str, servicenow_sys_id: str,
+                                  completed_actions: list, pending_actions: bool, monitor_task: asyncio.Task,
+                                  broadcast) -> dict:
+        """Process follow-up emails for actionable intents."""
+        email_id = email["id"]
+        sender = email["from"]
+        subject = email["subject"]
+        thread_id = email.get("threadId", email_id)
+        attachments = email.get("attachments", [])
+        sender_username = self._extract_sender_username(sender)
+        completion_intents = [
+            "github_revoke_access", "github_delete_repo", "aws_s3_delete_bucket",
+            "aws_ec2_terminate_instance", "aws_iam_remove_user", "aws_iam_remove_user_permission"
+        ]
+
+        if intent == "git_and_aws_intent":
+            return await self._handle_git_and_aws_follow_up(
+                sub_intents, details, email, ado_ticket_id, servicenow_sys_id, completed_actions,
+                pending_actions, sender_username, monitor_task, broadcast
+            )
+
+        query = self._build_ticket_query(ado_ticket_id, servicenow_sys_id)
+        if not query["$or"]:
+            logger.error(f"No valid ticket IDs for follow-up email ID={email_id}")
+            return {"status": "error", "message": "No valid ticket IDs for follow-up", "actions": [], "pending_actions": False}
+
+        action_details = self._create_action_details(intent, details)
+        self._update_ticket_with_action(query, intent, action_details, pending_actions, existing_ticket)
+
+        action_result = await self.perform_action(intent, details, broadcast=broadcast, email_id=email_id, thread_id=thread_id)
+        action_details["status"] = action_result.get("status", "failed")
+        action_details["message"] = action_result["message"]
+        if intent == "aws_ec2_launch_instance" and action_result.get("logs"):
+            action_details["logs"] = action_result["logs"]
+        completed_actions.append({"action": intent, "completed": action_result["success"]})
+
+        if intent == "aws_ec2_run_script" and not action_result["success"]:
+            await broadcast({
+                "type": "script_execution_failed",
+                "email_id": email_id,
+                "ado_ticket_id": ado_ticket_id,
+                "servicenow_sys_id": servicenow_sys_id,
+                "success": False,
+                "message": action_result["message"],
+                "thread_id": thread_id
+            })
+
+        if intent in completion_intents and action_result["success"]:
+            pending_actions = False
+            logger.info(f"Completion intent {intent} processed successfully for ticket ID={ado_ticket_id or servicenow_sys_id}")
+
+        self._update_ticket_with_action_result(query, intent, action_details, pending_actions, existing_ticket, action_result)
+
+        await broadcast({
+            "type": "action_performed",
+            "email_id": email_id,
+            "ado_ticket_id": ado_ticket_id,
+            "servicenow_sys_id": servicenow_sys_id,
+            "success": action_result["success"],
+            "message": action_details["message"],
+            "thread_id": thread_id
+        })
+
+        updated_ticket = self.tickets_collection.find_one(query)
+        all_completed = await self.are_all_actions_completed(updated_ticket)
+        await self._update_external_tickets(ado_ticket_id, servicenow_sys_id, all_completed, action_result["message"], pending_actions)
+
+        email_response = self._build_action_response(intent, action_details, action_result, sender_username)
+        reply = await self._send_reply(
+            sender, subject, email_response, thread_id, email_id, attachments, "", broadcast,
+            ado_ticket_id, servicenow_sys_id, intent
+        )
+        if reply:
+            await self.send_to_milvus(updated_ticket)
+
+        if monitor_task:
+            await self._stop_monitoring(details["instance_id"], email_id, thread_id, broadcast)
+
+        return {
+            "status": "success",
+            "ado_ticket_id": ado_ticket_id,
+            "servicenow_sys_id": servicenow_sys_id,
+            "intent": intent,
+            "actions": completed_actions,
+            "pending_actions": pending_actions,
+            "ticket_status": "In Progress" if pending_actions else ("Resolved" if all_completed else "In Progress")
+        }
+
+    async def _process_new_email(self, intent: str, sub_intents: list, details: dict, email: dict,
+                            ticket_description: str, email_content: str, attachments: list,
+                            sender: str, thread_id: str, email_id: str, subject: str, body: str,
+                            completed_actions: list, pending_actions: bool, monitor_task: asyncio.Task,
+                            broadcast) -> dict:
+        """Process new emails by creating tickets and performing actions."""
+        ado_ticket_id, servicenow_sys_id, ado_url, servicenow_url, ticket_status = await self._create_external_tickets(
+            subject, ticket_description, email_content, attachments, email_id, monitor_task, details, thread_id, broadcast
+        )
+
+        await broadcast({
+            "type": "ticket_created",
+            "email_id": email_id,
+            "ado_ticket_id": ado_ticket_id,
+            "servicenow_sys_id": servicenow_sys_id,
+            "ado_url": ado_url,
+            "servicenow_url": servicenow_url,
+            "intent": intent,
+            "thread_id": thread_id,
+            "status": ticket_status
+        })
+
+        cleaned_comments = self._clean_email_body(body)
+        remediation = ""
+        ticket_record = None
+
+        if intent == "general_it_request":
+            ticket_record, remediation = await self._handle_general_it_request(
+                email, ticket_description, cleaned_comments, sender, ado_ticket_id, servicenow_sys_id,
+                pending_actions, attachments
+            )
+            ticket_record["status"] = ticket_status
+        else:
+            ticket_record, action_details = await self._handle_actionable_intent(
+                intent, sub_intents, details, email, ticket_description, ado_ticket_id, servicenow_sys_id,
+                pending_actions, completed_actions, broadcast
+            )
+            ticket_record["status"] = ticket_status
+
+        try:
+            self.tickets_collection.insert_one(ticket_record)
+        except Exception as e:
+            return await self._handle_duplicate_ticket(
+                e, servicenow_sys_id, email, ado_ticket_id, intent, completed_actions, pending_actions, broadcast
+            )
+
+        if intent != "general_it_request":
+            await self.send_to_milvus(ticket_record)
+
+        updated_ticket = self.tickets_collection.find_one({
+            "$or": [
+                {"ado_ticket_id": ado_ticket_id} if ado_ticket_id else {},
+                {"servicenow_sys_id": servicenow_sys_id} if servicenow_sys_id else {}
+            ]
+        })
+        all_completed = await self.are_all_actions_completed(updated_ticket)
+        await self._update_external_tickets(
+            ado_ticket_id, servicenow_sys_id, all_completed,
+            action_details["message"] if intent != "general_it_request" and action_details else "Processed request",
+            pending_actions
+        )
+
+        email_response, combined_remediation = await self._fetch_and_combine_responses(
+            servicenow_sys_id, attachments, email_id, thread_id, intent, ticket_record, remediation, broadcast
+        )
+
+        sender_username = self._extract_sender_username(sender)
+        combined_body = f"Dear {sender_username},\n\n{email_response}"
+        if combined_remediation:
+            combined_body += f"\n\n{combined_remediation}"
+        combined_body += "\n\nBest regards,\nIT Support Agent"
+
+        reply = await self._send_reply(
+            sender, subject, combined_body, thread_id, email_id, attachments, "", broadcast,
+            ado_ticket_id, servicenow_sys_id, intent
+        )
+        if reply:
+            email_chain_entry = self._create_reply_email_chain_entry(reply, subject, combined_body)
+            self.tickets_collection.update_one(
+                {"thread_id": thread_id},
+                {"$push": {"email_chain": email_chain_entry}}
+            )
+            updated_ticket = self.tickets_collection.find_one({"thread_id": thread_id})
+            if updated_ticket:
+                await self.send_to_milvus(updated_ticket)
+
+        if monitor_task and intent != "general_it_request":
+            await self._stop_monitoring(details["instance_id"], email_id, thread_id, broadcast)
+
+        return {
+            "status": "success",
+            "ado_ticket_id": ado_ticket_id,
+            "servicenow_sys_id": servicenow_sys_id,
+            "intent": intent,
+            "actions": completed_actions,
+            "pending_actions": pending_actions,
+            "ticket_status": "In Progress" if pending_actions else ("Resolved" if all_completed else "In Progress")
+        }
+
+    def _create_email_chain_entry(self, email: dict) -> dict:
+        """Create an email chain entry for storage."""
+        return {
+            "email_id": email["id"],
+            "from": email["from"],
+            "subject": email["subject"],
+            "body": email["body"],
+            "timestamp": email.get("received", datetime.now().isoformat()),
+            "attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in email.get("attachments", [])]
+        }
+
+    def _create_reply_email_chain_entry(self, reply: dict, subject: str, body: str) -> dict:
+        """Create an email chain entry for a reply."""
+        return {
+            "email_id": reply.get("message_id", str(uuid.uuid4())),
+            "from": os.getenv('EMAIL_ADDRESS', 'IT Support <support@quadranttechnologies.com>'),
+            "subject": subject,
+            "body": body,
+            "timestamp": datetime.now().isoformat(),
+            "attachments": []
+        }
+
+    def _create_non_intent_ticket(self, email: dict) -> dict:
+        """Create a ticket record for non-intent emails."""
+        return {
+            "platform": self.platforms,
+            "sender": email["from"],
+            "subject": email["subject"],
+            "thread_id": email.get("threadId", email["id"]),
+            "email_id": email["id"],
+            "ticket_title": "Non-intent email",
+            "ticket_description": "Non-intent email detected",
+            "email_timestamp": datetime.now().isoformat(),
+            "updates": [],
+            "email_chain": [self._create_email_chain_entry(email)],
+            "pending_actions": False,
+            "type_of_request": "non_intent",
+            "details": {"attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in email.get("attachments", [])]},
+            "in_milvus": False,
+            **({"ado_ticket_id": None} if "ado" in self.platforms else {}),
+            **({"servicenow_sys_id": None} if "servicenow" in self.platforms else {})
+        }
+
+    def _extract_sender_username(self, sender: str) -> str:
+        """Extract username from sender email."""
+        return (sender.split('<')[0].strip() if '<' in sender else
+                sender.split('@')[0] if '@' in sender else sender)
+
+    def _build_ticket_query(self, ado_ticket_id: str, servicenow_sys_id: str) -> dict:
+        """Build query for ticket lookup."""
+        query = {"$or": []}
+        if "ado" in self.platforms and ado_ticket_id:
+            query["$or"].append({"ado_ticket_id": ado_ticket_id, "platform": {"$in": ["ado", ["ado", "servicenow"]]}})
+        if "servicenow" in self.platforms and servicenow_sys_id:
+            query["$or"].append({"servicenow_sys_id": servicenow_sys_id, "platform": {"$in": ["servicenow", ["ado", "servicenow"]]}})
+        return query
+
+    def _create_action_details(self, intent: str, details: dict) -> dict:
+        """Create action details for ticket update."""
+        action_details = {
+            "request_type": intent,
+            "status": "pending",
+            "message": f"Processing {intent}"
+        }
+        if intent.startswith("github_"):
+            action_details.update({
+                "repo_name": details["repo_name"],
+                "username": details["github_username"],
+                "access_type": details["access_type"] if intent == "github_access_request" else "unspecified",
+                "file_name": details["file_name"] if intent == "github_commit_file" else "unspecified",
+                "file_content": details["file_content"] if intent == "github_commit_file" else ""
+            })
+        elif intent.startswith("aws_s3_"):
+            action_details.update({
+                "bucket_name": details["bucket_name"],
+                "region": details["region"],
+                "acl": details["acl"] if intent == "aws_s3_create_bucket" else "unspecified"
+            })
+        elif intent.startswith("aws_ec2_"):
+            action_details.update({
+                "instance_type": details["instance_type"],
+                "ami_id": details["ami_id"],
+                "instance_id": details["instance_id"],
+                "region": details["region"],
+                "repo_name": details["repo_name"],
+                "script_name": details["script_name"],
+                "source_bucket": details["source_bucket"],
+                "destination_bucket": details["destination_bucket"],
+                "logs": ""
+            })
+        elif intent.startswith("aws_iam_"):
+            action_details.update({
+                "username": details["username"],
+                "permission": details["permission"] if "permission" in intent else "unspecified"
+            })
+        return action_details
+
+    def _update_ticket_with_action(self, query: dict, intent: str, action_details: dict,
+                                  pending_actions: bool, existing_ticket: dict):
+        """Update ticket with action details."""
+        ticket_status = action_details.get("status", "Doing")
+        update_operation = {
+            "$push": {
+                "details.aws" if intent.startswith("aws_") else "details.github": action_details,
+                "updates": {
+                    "status": ticket_status,
+                    "comment": action_details["message"],
+                    "revision_id": f"{intent.split('_')[1]}-{query['$or'][0].get('ado_ticket_id') or query['$or'][0].get('servicenow_sys_id')}-{len(existing_ticket.get('updates', [])) + 1}",
+                    "email_sent": False,
+                    "email_timestamp": datetime.now().isoformat()
+                }
+            },
+            "$set": {
+                "pending_actions": pending_actions,
+                "status": ticket_status  # Update status
+            }
+        }
+        self.tickets_collection.update_one(query, update_operation)
+
+    def _update_ticket_with_action_result(self, query: dict, intent: str, action_details: dict,
+                                            pending_actions: bool, existing_ticket: dict, action_result: dict):
+            """Update ticket with action result."""
+            ticket_status = action_details.get("status", "Doing")
+            array_filter = {
+                "repo_name": action_details["repo_name"],
+                "username": action_details["username"],
+                "request_type": intent
+            } if intent.startswith("github_") else {"request_type": intent}
+            update_operation = {
+                "$set": {
+                    f"details.{'aws' if intent.startswith('aws_') else 'github'}.$[elem].status": action_details["status"],
+                    f"details.{'aws' if intent.startswith('aws_') else 'github'}.$[elem].message": action_details["message"],
+                    "pending_actions": pending_actions,
+                    "status": ticket_status  # Update status
+                },
+                "$push": {
+                    "updates": {
+                        "status": ticket_status,
+                        "comment": action_details["message"],
+                        "revision_id": f"result-{query['$or'][0].get('ado_ticket_id') or query['$or'][0].get('servicenow_sys_id')}-{len(existing_ticket.get('updates', [])) + 2}",
+                        "email_sent": False,
+                        "email_timestamp": datetime.now().isoformat()
+                    }
+                }
+            }
+            if intent == "aws_ec2_launch_instance" and action_result.get("logs"):
+                update_operation["$set"][f"details.aws.$[elem].logs"] = action_details["logs"]
+            try:
+                self.tickets_collection.update_one(
+                    query, update_operation, array_filters=[{"elem.request_type": intent}]
+                )
+            except Exception as e:
+                logger.error(f"Failed to update ticket for intent {intent}: {str(e)}")
+                raise ValueError(f"Ticket update failed: {str(e)}")
+
+    async def _update_external_tickets(self, ado_ticket_id: str, servicenow_sys_id: str,
+                                  all_completed: bool, comment: str, pending_actions: bool = False):
+        """Update ADO and ServiceNow tickets."""
+        # Set ticket status based on pending_actions and all_completed
+        ado_status = "Done" if not pending_actions and all_completed else "Doing"
+        servicenow_state = "Resolved" if not pending_actions and all_completed else "In Progress"
+        ticket_status = ado_status if ado_ticket_id else servicenow_state
+        try:
+            if "ado" in self.platforms and ado_ticket_id:
+                await self.kernel.invoke(
+                    self.kernel.plugins["ado"]["update_ticket"],
+                    ticket_id=ado_ticket_id,
+                    status=ado_status,
+                    comment=comment
+                )
+            if "servicenow" in self.platforms and servicenow_sys_id:
+                await self.kernel.invoke(
+                    self.kernel.plugins["servicenow"]["update_ticket"],
+                    ticket_id=servicenow_sys_id,
+                    state=servicenow_state,
+                    comment=comment
+                )
+            # Update MongoDB ticket status
+            self.tickets_collection.update_one(
+                {
+                    "$or": [
+                        {"ado_ticket_id": ado_ticket_id} if ado_ticket_id else {},
+                        {"servicenow_sys_id": servicenow_sys_id} if servicenow_sys_id else {}
+                    ]
+                },
+                {"$set": {"status": ticket_status, "pending_actions": pending_actions}}
+            )
+        except Exception as e:
+            logger.error(f"Failed to update tickets {ado_ticket_id or servicenow_sys_id}: {str(e)}")
+            raise ValueError(f"Ticket update failed: {str(e)}")
+
+    def _build_action_response(self, intent: str, action_details: dict, action_result: dict,
+                              sender_username: str) -> str:
+        """Build email response for action result."""
+        email_response = f"Your request to {intent.replace('_', ' ')} has been processed.\nStatus: {action_details['status']}\nDetails: {action_details['message']}"
+        if intent == "aws_ec2_launch_instance" and action_result.get("logs"):
+            email_response += f"\n\nEC2 Execution Logs:\n{action_result['logs']}"
+        return f"Dear {sender_username},\n\n{email_response}\n\nBest regards,\nIT Support Agent"
+
+    async def _send_reply(self, to: str, subject: str, body: str, thread_id: str, message_id: str,
+                          attachments: list, remediation: str, broadcast, ado_ticket_id: str = None,
+                          servicenow_sys_id: str = None, intent: str = None) -> dict:
+        """Send an email reply."""
+        reply_result = await self.kernel.invoke(
+            self.kernel.plugins["email_sender"]["send_reply"],
+            to=to,
+            subject=subject,
+            body=body,
+            thread_id=thread_id,
+            message_id=message_id,
+            attachments=attachments,
+            remediation=remediation
+        )
+        reply = reply_result.value if reply_result else None
+        if reply:
+            await broadcast({
+                "type": "email_reply",
+                "email_id": message_id,
+                "thread_id": thread_id,
+                "ado_ticket_id": ado_ticket_id,
+                "servicenow_sys_id": servicenow_sys_id,
+                "message": f"Sent response for {intent.replace('_', ' ')} request" if intent else "Sent response",
+                "timestamp": datetime.now().isoformat()
+            })
+        return reply
+
+    async def _handle_git_and_aws_follow_up(self, sub_intents: list, details: dict, email: dict,
+                                       ado_ticket_id: str, servicenow_sys_id: str, completed_actions: list,
+                                       pending_actions: bool, sender_username: str, monitor_task: asyncio.Task,
+                                       broadcast) -> dict:
+        """Handle follow-up for git_and_aws_intent."""
+        email_id = email["id"]
+        sender = email["from"]
+        subject = email["subject"]
+        thread_id = email.get("threadId", email_id)
+        attachments = email.get("attachments", [])
+        completion_intents = [
+            "github_revoke_access", "github_delete_repo", "aws_s3_delete_bucket",
+            "aws_ec2_terminate_instance", "aws_iam_remove_user", "aws_iam_remove_user_permission"
+        ]
+
+        query = self._build_ticket_query(ado_ticket_id, servicenow_sys_id)
+        if not query["$or"]:
+            logger.error(f"No valid ticket IDs for follow-up email ID={email_id}")
+            return {"status": "error", "message": "No valid ticket IDs for follow-up", "actions": [], "pending_actions": False}
+
+        email_responses = []
+        for sub_intent in sub_intents:
+            sub_intent_name = sub_intent["intent"]
+            sub_action_details = self._create_action_details(sub_intent_name, details)
+            self._update_ticket_with_action(query, sub_intent_name, sub_action_details, pending_actions, {})
+
+            sub_action_result = await self.perform_action(sub_intent_name, details, broadcast=broadcast, email_id=email_id, thread_id=thread_id)
+            sub_action_details["status"] = sub_action_result.get("status", "failed")
+            sub_action_details["message"] = sub_action_result["message"]
+            if sub_intent_name == "aws_ec2_launch_instance" and sub_action_result.get("logs"):
+                sub_action_details["logs"] = sub_action_result["logs"]
+            completed_actions.append({"action": sub_intent_name, "completed": sub_action_result["success"]})
+
+            sub_email_response = f"Sub-request to {sub_intent_name.replace('_', ' ')}:\nStatus: {sub_action_details['status']}\nDetails: {sub_action_details['message']}"
+            if sub_intent_name == "aws_ec2_launch_instance" and sub_action_result.get("logs"):
+                sub_email_response += f"\n\nEC2 Execution Logs:\n{sub_action_result['logs']}"
+            email_responses.append(sub_email_response)
+
+            if sub_intent_name == "aws_ec2_run_script" and not sub_action_result["success"]:
+                await broadcast({
+                    "type": "script_execution_failed",
+                    "email_id": email_id,
+                    "ado_ticket_id": ado_ticket_id,
+                    "servicenow_sys_id": servicenow_sys_id,
+                    "success": False,
+                    "message": sub_action_result["message"],
+                    "thread_id": thread_id
+                })
+
+            if sub_intent_name in ["aws_ec2_run_script", "aws_ec2_launch_instance"] and sub_action_result.get("permission_fixed"):
+                await broadcast({
+                    "type": "permission_fixed",
+                    "email_id": email_id,
+                    "ado_ticket_id": ado_ticket_id,
+                    "servicenow_sys_id": servicenow_sys_id,
+                    "message": sub_action_result.get("permission_message", "Permission issue fixed"),
+                    "thread_id": thread_id
+                })
+
+            if sub_intent_name in completion_intents and sub_action_result["success"]:
+                pending_actions = False
+                logger.info(f"Completion sub-intent {sub_intent_name} processed successfully for ticket ID={ado_ticket_id or servicenow_sys_id}")
+
+            self._update_ticket_with_action_result(query, sub_intent_name, sub_action_details, pending_actions, {}, sub_action_result)
+
+            await broadcast({
+                "type": "action_performed",
+                "email_id": email_id,
+                "ado_ticket_id": ado_ticket_id,
+                "servicenow_sys_id": servicenow_sys_id,
+                "success": sub_action_result["success"],
+                "message": sub_action_details["message"],
+                "thread_id": thread_id
+            })
+
+        updated_ticket = self.tickets_collection.find_one(query)
+        all_completed = await self.are_all_actions_completed(updated_ticket)
+        await self._update_external_tickets(ado_ticket_id, servicenow_sys_id, all_completed, "Processed combined GitHub and AWS actions", pending_actions)
+
+        email_response = "\n\n".join(email_responses)
+        combined_body = f"Dear {sender_username},\n\nYour combined GitHub and AWS requests have been processed:\n\n{email_response}\n\nBest regards,\nIT Support Agent"
+
+        reply = await self._send_reply(
+            sender, subject, combined_body, thread_id, email_id, attachments, "", broadcast,
+            ado_ticket_id, servicenow_sys_id, "git_and_aws_intent"
+        )
+        if reply:
+            await self.send_to_milvus(updated_ticket)
+
+        if monitor_task:
+            await self._stop_monitoring(details["instance_id"], email_id, thread_id, broadcast)
+
+        return {
+            "status": "success",
+            "ado_ticket_id": ado_ticket_id,
+            "servicenow_sys_id": servicenow_sys_id,
+            "intent": "git_and_aws_intent",
+            "actions": completed_actions,
+            "pending_actions": pending_actions,
+            "ticket_status": "In Progress" if pending_actions else ("Resolved" if all_completed else "In Progress")
+        }
+
+    async def _create_external_tickets(self, subject: str, ticket_description: str, email_content: str,
+                                      attachments: list, email_id: str, monitor_task: asyncio.Task,
+                                      details: dict, thread_id: str, broadcast) -> tuple:
+        """Create ADO and ServiceNow tickets."""
+        ado_ticket_id = None
+        servicenow_sys_id = None
+        ado_url = None
+        servicenow_url = None
+        ticket_status = "Pending"  # Default status
+
+        if "ado" in self.platforms:
+            ado_ticket_result = await self.kernel.invoke(
+                self.kernel.plugins["ado"]["create_ticket"],
+                title=subject,
+                description=ticket_description,
+                email_content=email_content,
+                attachments=attachments
+            )
+            if not ado_ticket_result or not ado_ticket_result.value:
+                logger.error(f"Failed to create ADO ticket for email ID={email_id}")
+                if monitor_task:
+                    await self._stop_monitoring(details["instance_id"], email_id, thread_id, broadcast)
+                return None, None, None, None, ticket_status
+            ado_ticket_data = ado_ticket_result.value
+            ado_ticket_id = ado_ticket_data["id"]
+            ado_url = ado_ticket_data["url"]
+            ticket_status = "To Do"  # Default ADO status
+
+        if "servicenow" in self.platforms:
+            servicenow_ticket_result = await self.kernel.invoke(
+                self.kernel.plugins["servicenow"]["create_ticket"],
+                title=subject,
+                description=ticket_description,
+                email_content=email_content,
+                attachments=[a for a in attachments if isinstance(a, dict) and "path" in a and "filename" in a]
+            )
+            if servicenow_ticket_result and servicenow_ticket_result.value:
+                servicenow_ticket_data = servicenow_ticket_result.value
+                servicenow_sys_id = servicenow_ticket_data["sys_id"]
+                servicenow_url = servicenow_ticket_data["url"]
+                ticket_status = "New"  # Default ServiceNow state
+
+        return ado_ticket_id, servicenow_sys_id, ado_url, servicenow_url, ticket_status
+
+    def _clean_email_body(self, body: str) -> str:
+        """Clean email body for comments."""
+        return BeautifulSoup(body, "html.parser").get_text().strip() if "<html>" in body.lower() else body.strip()
+
+    async def _handle_general_it_request(self, email: dict, ticket_description: str, cleaned_comments: str,
+                                        sender: str, ado_ticket_id: str, servicenow_sys_id: str,
+                                        pending_actions: bool, attachments: list) -> tuple:
+        """Handle general IT request intent."""
+        sender_username = self._extract_sender_username(sender)
+        has_matches, matching_ticket = await self.search_milvus_for_solution(
+            email["subject"], ticket_description, cleaned_comments
+        )
+        ticket_record = {
+            "platform": self.platforms,
+            "sender": sender,
+            "subject": email["subject"],
+            "thread_id": email.get("threadId", email["id"]),
+            "email_id": email["id"],
+            "ticket_title": email["subject"],
+            "ticket_description": ticket_description,
+            "email_timestamp": datetime.now().isoformat(),
+            "updates": [{
+                "status": "New",
+                "comment": cleaned_comments,
+                "revision_id": f"initial-{ado_ticket_id or servicenow_sys_id}-1",
+                "email_sent": False,
+                "email_message_id": None,
+                "email_timestamp": datetime.now().isoformat()
+            }],
+            "email_chain": [self._create_email_chain_entry(email)],
+            "pending_actions": pending_actions,
+            "type_of_request": "general_it_request",
+            "details": {"attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in attachments]},
+            "in_milvus": has_matches,
+            **({"ado_ticket_id": ado_ticket_id} if ado_ticket_id else {}),
+            **({"servicenow_sys_id": servicenow_sys_id} if servicenow_sys_id else {})
+        }
+
+        remediation = ""
+        if has_matches:
+            remediation = await self.restructure_remediation_from_milvus(matching_ticket, sender_username)
+            ticket_record["remediation"] = remediation
+        else:
+            await self.send_to_milvus(ticket_record)
+
+        detailed_description = f"User {sender_username}: {ticket_description}"
+        ticket_record["details"]["general"] = [{
+            "request_type": "general_it_request",
+            "status": "pending",
+            "message": detailed_description,
+            "requester": sender_username
+        }]
+        ticket_record["ticket_description"] = detailed_description
+
+        return ticket_record, remediation
+
+    async def _handle_actionable_intent(self, intent: str, sub_intents: list, details: dict, email: dict,
+                                   ticket_description: str, ado_ticket_id: str, servicenow_sys_id: str,
+                                   pending_actions: bool, completed_actions: list, broadcast) -> tuple:
+        """Handle actionable intents."""
+        email_id = email["id"]
+        thread_id = email.get("threadId", email_id)
+        action_details = None
+
+        if intent != "git_and_aws_intent":
+            action_result = await self.perform_action(intent, details, broadcast=broadcast, email_id=email_id, thread_id=thread_id)
+            action_details = self._create_action_details(intent, details)
+            action_details["status"] = action_result.get("status", "failed")
+            action_details["message"] = action_result["message"]
+            if intent == "aws_ec2_launch_instance":
+                action_details["instance_id"] = action_result.get("instance_id", details["instance_id"])
+                if action_result.get("logs"):
+                    action_details["logs"] = action_result["logs"]
+            completed_actions.append({"action": intent, "completed": action_result["success"]})
+
+            # Broadcast action performed for all intents
+            await broadcast({
+                "type": "action_performed",
+                "email_id": email_id,
+                "ado_ticket_id": ado_ticket_id,
+                "servicenow_sys_id": servicenow_sys_id,
+                "success": action_result["success"],
+                "message": action_details["message"],
+                "thread_id": thread_id
+            })
+
+            if intent == "aws_ec2_run_script" and not action_result["success"]:
+                await broadcast({
+                    "type": "script_execution_failed",
+                    "email_id": email_id,
+                    "ado_ticket_id": ado_ticket_id,
+                    "servicenow_sys_id": servicenow_sys_id,
+                    "success": False,
+                    "message": action_result["message"],
+                    "thread_id": thread_id
+                })
+
+            if intent in ["aws_ec2_run_script", "aws_ec2_launch_instance"] and action_result.get("permission_fixed"):
+                await broadcast({
+                    "type": "permission_fixed",
+                    "email_id": email_id,
+                    "ado_ticket_id": ado_ticket_id,
+                    "servicenow_sys_id": servicenow_sys_id,
+                    "message": action_result.get("permission_message", "Permission issue fixed"),
+                    "thread_id": thread_id
+                })
+
+        else:
+            for sub_intent in sub_intents:
+                sub_intent_name = sub_intent["intent"]
+                sub_action_result = await self.perform_action(sub_intent_name, details, broadcast=broadcast, email_id=email_id, thread_id=thread_id)
+                sub_action_details = self._create_action_details(sub_intent_name, details)
+                sub_action_details["status"] = sub_action_result.get("status", "failed")
+                sub_action_details["message"] = sub_action_result["message"]
+                if sub_intent_name == "aws_ec2_launch_instance":
+                    sub_action_details["instance_id"] = sub_action_result.get("instance_id", details["instance_id"])
+                    if sub_action_result.get("logs"):
+                        sub_action_details["logs"] = sub_action_result["logs"]
+                completed_actions.append({"action": sub_intent_name, "completed": sub_action_result["success"]})
+
+                if sub_intent_name == "aws_ec2_run_script" and not sub_action_result["success"]:
+                    await broadcast({
+                        "type": "script_execution_failed",
+                        "email_id": email_id,
+                        "ado_ticket_id": ado_ticket_id,
+                        "servicenow_sys_id": servicenow_sys_id,
+                        "success": False,
+                        "message": sub_action_result["message"],
+                        "thread_id": thread_id
+                    })
+
+                if sub_intent_name in ["aws_ec2_run_script", "aws_ec2_launch_instance"] and sub_action_result.get("permission_fixed"):
+                    await broadcast({
+                        "type": "permission_fixed",
+                        "email_id": email_id,
+                        "ado_ticket_id": ado_ticket_id,
+                        "servicenow_sys_id": servicenow_sys_id,
+                        "message": sub_action_result.get("permission_message", "Permission issue fixed"),
+                        "thread_id": thread_id
+                    })
+
+                self.tickets_collection.update_one(
+                    {"ado_ticket_id": ado_ticket_id, "servicenow_sys_id": servicenow_sys_id},
+                    {
+                        "$push": {
+                            f"details.{'aws' if sub_intent_name.startswith('aws_') else 'github'}": sub_action_details,
+                            "updates": {
+                                "status": "Doing",
+                                "comment": sub_action_result["message"],
+                                "revision_id": f"{sub_intent_name.split('_')[1]}-{ado_ticket_id or servicenow_sys_id}-{len(completed_actions)}",
+                                "email_sent": False,
+                                "email_message_id": None,
+                                "email_timestamp": datetime.now().isoformat()
+                            }
+                        }
+                    }
+                )
+
+                await broadcast({
+                    "type": "action_performed",
+                    "email_id": email_id,
+                    "ado_ticket_id": ado_ticket_id,
+                    "servicenow_sys_id": servicenow_sys_id,
+                    "success": sub_action_result["success"],
+                    "message": sub_action_details["message"],
+                    "thread_id": thread_id
+                })
+
+        ticket_record = {
+            "platform": self.platforms,
+            "sender": email["from"],
+            "subject": email["subject"],
+            "thread_id": thread_id,
+            "email_id": email_id,
+            "ticket_title": email["subject"],
+            "ticket_description": ticket_description,
+            "email_timestamp": datetime.now().isoformat(),
+            "updates": [],
+            "email_chain": [self._create_email_chain_entry(email)],
+            "pending_actions": pending_actions,
+            "type_of_request": intent,
+            "details": {"attachments": [{"filename": a["filename"], "mimeType": a["mimeType"]} for a in email.get("attachments", [])]},
+            "in_milvus": False,
+            **({"ado_ticket_id": ado_ticket_id} if ado_ticket_id else {}),
+            **({"servicenow_sys_id": servicenow_sys_id} if servicenow_sys_id else {})
+        }
+        if action_details:
+            ticket_record["details"]["aws" if intent.startswith("aws_") else "github"] = [action_details]
+        elif intent == "git_and_aws_intent":
+            ticket_record["details"]["github"] = [
+                d for d in completed_actions if d["action"].startswith("github_")
+            ]
+            ticket_record["details"]["aws"] = [
+                d for d in completed_actions if d["action"].startswith("aws_")
+            ]
+
+        return ticket_record, action_details
+
+    async def _handle_duplicate_ticket(self, error: Exception, servicenow_sys_id: str, email: dict,
+                                      ado_ticket_id: str, intent: str, completed_actions: list,
+                                      pending_actions: bool, broadcast) -> dict:
+        """Handle duplicate ticket errors."""
+        email_id = email["id"]
+        thread_id = email.get("threadId", email_id)
+        if "E11000" in str(error) and "servicenow_sys_id_1" in str(error):
+            logger.warning(f"Duplicate ServiceNow ticket for sys_id={servicenow_sys_id}")
+            email_chain_entry = self._create_email_chain_entry(email)
+            self.tickets_collection.update_one(
+                {"servicenow_sys_id": servicenow_sys_id},
+                {
+                    "$push": {
+                        "email_chain": email_chain_entry,
+                        "updates": {
+                            "status": "Doing",
+                            "comment": f"Duplicate ticket attempt; updated with new email ID={email_id}",
+                            "revision_id": f"duplicate-{servicenow_sys_id}-1",
+                            "email_sent": False,
+                            "email_message_id": None,
+                            "email_timestamp": datetime.now().isoformat()
+                        }
+                    }
+                }
+            )
+            updated_ticket = self.tickets_collection.find_one({"servicenow_sys_id": servicenow_sys_id})
+            if updated_ticket:
+                await self.send_to_milvus(updated_ticket)
+            await broadcast({
+                "type": "ticket_updated",
+                "email_id": email_id,
+                "ado_ticket_id": ado_ticket_id,
+                "servicenow_sys_id": servicenow_sys_id,
+                "thread_id": thread_id,
+                "message": f"Updated existing ServiceNow ticket {servicenow_sys_id} with new email"
+            })
+            return {
+                "status": "success",
+                "ado_ticket_id": ado_ticket_id,
+                "servicenow_sys_id": servicenow_sys_id,
+                "intent": intent,
+                "actions": completed_actions,
+                "pending_actions": pending_actions,
+                "message": f"Updated existing ServiceNow ticket {servicenow_sys_id}"
+            }
+        logger.error(f"Failed to insert ticket for email ID={email_id}: {str(error)}")
+        raise ValueError(f"Ticket insertion failed: {str(error)}")
+
+    async def _fetch_and_combine_responses(self, servicenow_sys_id: str, attachments: list, email_id: str,
+                                          thread_id: str, intent: str, ticket_record: dict,
+                                          remediation: str, broadcast) -> tuple:
+        """Fetch ServiceNow updates and combine responses."""
+        servicenow_updates = []
+        if "servicenow" in self.platforms and servicenow_sys_id:
+            try:
+                servicenow_updates_result = await self.kernel.invoke(
+                    self.kernel.plugins["servicenow"]["get_ticket_updates"],
+                    ticket_id=servicenow_sys_id
+                )
+                servicenow_updates = servicenow_updates_result.value if servicenow_updates_result else []
+            except Exception as e:
+                logger.error(f"Failed to fetch ServiceNow updates for sys_id={servicenow_sys_id}: {str(e)}")
+                await broadcast({
+                    "type": "error",
+                    "email_id": email_id,
+                    "message": f"Failed to fetch ServiceNow updates: {str(e)}",
+                    "thread_id": thread_id
+                })
+        else:
+            logger.warning(f"No ServiceNow sys_id provided or platform not selected for email ID={email_id}")
+            await broadcast({
+                "type": "error",
+                "email_id": email_id,
+                "message": "No ServiceNow sys_id available or platform not selected for update fetching",
+                "thread_id": thread_id
+            })
+
+        try:
+            update_result = await self.analyze_ticket_update(servicenow_sys_id, servicenow_updates, attachments)
+            email_response = update_result.get("email_response", "No updates available.")
+            existing_remediation = update_result.get("remediation", "")
+        except Exception as e:
+            logger.error(f"Error analyzing ticket update for sys_id={servicenow_sys_id}: {str(e)}")
+            email_response = "Unable to process ticket updates at this time."
+            existing_remediation = ""
+            await broadcast({
+                "type": "error",
+                "email_id": email_id,
+                "message": f"Failed to analyze ticket updates: {str(e)}",
+                "thread_id": thread_id
+            })
+
+        combined_remediation = existing_remediation
+        if remediation:
+            combined_remediation = (
+                f"{existing_remediation}\n\n**While we work on resolving your issue, you can try these remediation steps retrieved from the knowledge base articles:**\n\n{remediation}"
+                if existing_remediation else
+                f"**While we work on resolving your issue, you can try these remediation steps retrieved from the knowledge base articles:**\n\n{remediation}"
+            )
+
+        if intent in ["git_and_aws_intent", "aws_ec2_launch_instance"]:
+            ec2_actions = [
+                action for action in ticket_record.get("details", {}).get("aws", [])
+                if action["request_type"] == "aws_ec2_launch_instance" and action.get("logs")
+            ]
+            if ec2_actions:
+                email_response += f"\n\nEC2 Execution Logs:\n{ec2_actions[-1]['logs']}"
+
+        return email_response, combined_remediation
+
+    async def _stop_monitoring(self, instance_id: str, email_id: str, thread_id: str, broadcast):
+        """Stop CloudWatch monitoring."""
+        await self.stop_monitoring(instance_id)
+        await broadcast({
+            "type": "monitoring_stopped",
+            "email_id": email_id,
+            "instance_id": instance_id,
+            "message": f"Stopped CloudWatch monitoring for instance {instance_id}",
+            "thread_id": thread_id
+        })
 
     async def stop_monitoring(self, instance_id: str):
         """Stop monitoring for the specified instance."""
